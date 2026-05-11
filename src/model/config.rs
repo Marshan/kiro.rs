@@ -98,6 +98,14 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// 是否开启 API 调用详细日志（默认 false）
+    #[serde(default)]
+    pub api_log_enabled: bool,
+
+    /// API 日志文件路径（默认 "api.log"）
+    #[serde(default)]
+    pub api_log_path: Option<String>,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -185,6 +193,8 @@ impl Default for Config {
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,
+            api_log_enabled: false,
+            api_log_path: None,
         }
     }
 }

@@ -539,6 +539,8 @@ pub struct StreamContext {
     pub thinking_block_index: Option<i32>,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
+    /// 累积的完整输出文本（用于 API 日志）
+    pub output_text: String,
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
@@ -567,6 +569,7 @@ impl StreamContext {
             thinking_extracted: false,
             thinking_block_index: None,
             text_block_index: None,
+            output_text: String::new(),
             strip_thinking_leading_newline: false,
         }
     }
@@ -848,6 +851,9 @@ impl StreamContext {
     ///
     /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
     fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
+        // 累积输出文本供 API 日志使用
+        self.output_text.push_str(text);
+
         let mut events = Vec::new();
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
@@ -1141,7 +1147,7 @@ impl StreamContext {
 /// 4. 一次性返回所有事件
 pub struct BufferedStreamContext {
     /// 内部流处理上下文（复用现有的事件处理逻辑）
-    inner: StreamContext,
+    pub inner: StreamContext,
     /// 缓冲的所有事件（包括 message_start、content_block_start 等）
     event_buffer: Vec<SseEvent>,
     /// 估算的 input_tokens（用于回退）

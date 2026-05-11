@@ -25,6 +25,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// API 调用日志记录器（可选）
+    pub api_logger: Option<Arc<crate::api_logger::ApiLogger>>,
 }
 
 impl AppState {
@@ -34,12 +36,19 @@ impl AppState {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            api_logger: None,
         }
     }
 
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
+        self
+    }
+
+    /// 设置 ApiLogger
+    pub fn with_api_logger(mut self, logger: Arc<crate::api_logger::ApiLogger>) -> Self {
+        self.api_logger = Some(logger);
         self
     }
 }

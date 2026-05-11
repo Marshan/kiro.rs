@@ -1,6 +1,7 @@
 mod admin;
 mod admin_ui;
 mod anthropic;
+mod api_logger;
 mod common;
 mod http_client;
 mod kiro;
@@ -157,11 +158,21 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // 初始化 API 调用日志记录器（可选）
+    let api_logger = if config.api_log_enabled {
+        let path = config.api_log_path.as_deref().unwrap_or("api.log");
+        tracing::info!("API 调用日志已启用，写入: {}", path);
+        Some(api_logger::create_api_logger(path))
+    } else {
+        None
+    };
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
+        api_logger,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

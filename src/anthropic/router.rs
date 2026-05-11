@@ -38,10 +38,14 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    api_logger: Option<std::sync::Arc<crate::api_logger::ApiLogger>>,
 ) -> Router {
     let mut state = AppState::new(api_key, extract_thinking);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
+    }
+    if let Some(logger) = api_logger {
+        state = state.with_api_logger(logger);
     }
 
     // 需要认证的 /v1 路由
