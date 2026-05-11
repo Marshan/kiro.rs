@@ -22,6 +22,13 @@
 本项目仅供研究使用, Use at your own risk, 使用本项目所导致的任何后果由使用人承担, 与本项目无关。
 本项目与 AWS/KIRO/Anthropic/Claude 等官方无关, 本项目不代表官方立场。
 
+## 本 Fork 新增
+
+基于原作者 2026.5.10 master 分支，新增以下功能：
+
+- **Claude Opus 4.7 模型支持**：客户端请求中模型名包含 `4.7` 或 `4-7` 时自动映射到 `claude-opus-4.7`
+- **API 调用明细日志**：可选开启，将每次 LLM 请求/响应明文记录到文件，便于调试和审计（配置项 `apiLogEnabled` / `apiLogPath`）
+
 ## 注意！
 
 因 TLS 默认从 native-tls 切换至 rustls，你可能需要专门安装证书后才能配置 HTTP 代理。可通过 `config.json` 的 `tlsBackend` 切回 `native-tls`。
@@ -191,6 +198,8 @@ docker-compose up
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
+| `apiLogEnabled` | boolean | `false` | 是否启用 API 调用日志，记录客户端请求、Kiro 转发请求和响应到文件 |
+| `apiLogPath` | string | `api.log` | API 日志文件路径（仅 `apiLogEnabled=true` 时生效） |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 
 完整配置示例：
@@ -216,7 +225,9 @@ docker-compose up
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
    "loadBalancingMode": "priority",
-   "extractThinking": true
+   "extractThinking": true,
+   "apiLogEnabled": false,
+   "apiLogPath": "api.log"
 }
 ```
 
@@ -438,6 +449,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
 | `*sonnet*` | `claude-sonnet-4.5` |
+| `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
 | `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
 | `*opus*`（其他） | `claude-opus-4.6` |
 | `*haiku*` | `claude-haiku-4.5` |
@@ -463,6 +475,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 1. **凭证安全**: 请妥善保管 `credentials.json` 文件，不要提交到版本控制
 2. **Token 刷新**: 服务会自动刷新过期的 Token，无需手动干预
 3. **WebSearch 工具**: 当 `tools` 列表仅包含一个 `web_search` 工具时，会走内置 WebSearch 转换逻辑
+4. **API 调用日志**: 开启 `apiLogEnabled` 后，`apiLogPath` 指向的文件会记录请求和响应的明文内容（含 messages、tool 调用参数等），请勿提交到版本控制；日志采用追加写入且**无自动切割**，长期运行请自行轮转
 
 ## 项目结构
 
