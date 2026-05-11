@@ -199,6 +199,11 @@ impl KiroProvider {
             }
 
             // 失败响应
+            let retry_after_secs = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
             let body = response.text().await.unwrap_or_default();
 
             // 402 额度用尽
@@ -248,7 +253,13 @@ impl KiroProvider {
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    let delay = if status.as_u16() == 429 {
+                        Self::retry_delay_rate_limited(attempt, retry_after_secs)
+                    } else {
+                        Self::retry_delay(attempt)
+                    };
+                    tracing::info!("等待 {:.1}s 后重试", delay.as_secs_f32());
+                    sleep(delay).await;
                 }
                 continue;
             }
@@ -358,6 +369,12 @@ impl KiroProvider {
             }
 
             // 失败响应：读取 body 用于日志/错误信息
+            // 在消费 body 前先保存 Retry-After 头（429 限流时使用）
+            let retry_after_secs = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
             let body = response.text().await.unwrap_or_default();
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
@@ -451,7 +468,13 @@ impl KiroProvider {
                     body
                 ));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    let delay = if status.as_u16() == 429 {
+                        Self::retry_delay_rate_limited(attempt, retry_after_secs)
+                    } else {
+                        Self::retry_delay(attempt)
+                    };
+                    tracing::info!("等待 {:.1}s 后重试", delay.as_secs_f32());
+                    sleep(delay).await;
                 }
                 continue;
             }
@@ -513,6 +536,20 @@ impl KiroProvider {
         let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
         let backoff = exp.min(MAX_MS);
         let jitter_max = (backoff / 4).max(1);
+        let jitter = fastrand::u64(0..=jitter_max);
+        Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    /// 429 限流专用退避：基础 5s，上限 60s
+    fn retry_delay_rate_limited(attempt: usize, retry_after_secs: Option<u64>) -> Duration {
+        if let Some(secs) = retry_after_secs {
+            return Duration::from_secs(secs.min(120));
+        }
+        const BASE_MS: u64 = 5_000;
+        const MAX_MS: u64 = 60_000;
+        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(4) as u32));
+        let backoff = exp.min(MAX_MS);
+        let jitter_max = (backoff / 5).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
     }

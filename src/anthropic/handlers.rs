@@ -289,10 +289,13 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    // 为本次入站请求生成统一的日志追踪 ID，贯穿 REQUEST / KIRO REQUEST / RESPONSE 三行日志
+    let request_id = format!("msg_{}", Uuid::new_v4().to_string().replace('-', ""));
+
     // 写入 REQUEST 日志
     if let Some(ref logger) = state.api_logger {
         let entry = crate::api_logger::ApiLogger::format_request(
-            &format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+            &request_id,
             &model_in,
             &model_kiro,
             payload.stream,
@@ -331,16 +334,18 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             api_logger,
+            &request_id,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &model_in, &model_kiro, input_tokens, extract_thinking, tool_name_map, api_logger).await
+        handle_non_stream_request(provider, &request_body, &model_in, &model_kiro, input_tokens, extract_thinking, tool_name_map, api_logger, &request_id).await
     }
 }
 
 /// 处理流式请求
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -350,12 +355,12 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     api_logger: Option<Arc<crate::api_logger::ApiLogger>>,
+    request_id: &str,
 ) -> Response {
     // 写入 KIRO REQUEST 日志
     if let Some(ref logger) = api_logger {
-        // 从 StreamContext 的 message_id 格式生成一致的 request_id（此处用占位，实际 id 在 ctx 里）
         let entry = crate::api_logger::ApiLogger::format_kiro_request(
-            "pending",
+            request_id,
             &format!("https://q.*.amazonaws.com/generateAssistantResponse (model: {model_kiro})"),
             request_body,
         );
@@ -377,7 +382,7 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events, api_logger, model_in.to_string(), model_kiro.to_string(), start);
+    let stream = create_sse_stream(response, ctx, initial_events, api_logger, model_in.to_string(), model_kiro.to_string(), start, request_id.to_string());
 
     // 返回 SSE 响应
     Response::builder()
@@ -398,6 +403,7 @@ fn create_ping_sse() -> Bytes {
 }
 
 /// 创建 SSE 事件流
+#[allow(clippy::too_many_arguments)]
 fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
@@ -406,6 +412,7 @@ fn create_sse_stream(
     model_in: String,
     model_kiro: String,
     start: Instant,
+    request_id: String,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -418,8 +425,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), api_logger, model_in, model_kiro, start),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, api_logger, model_in, model_kiro, start)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), api_logger, model_in, model_kiro, start, request_id),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, api_logger, model_in, model_kiro, start, request_id)| async move {
             if finished {
                 return None;
             }
@@ -456,7 +463,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, api_logger, model_in, model_kiro, start)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, api_logger, model_in, model_kiro, start, request_id)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -466,7 +473,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, api_logger, model_in, model_kiro, start)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, api_logger, model_in, model_kiro, start, request_id)))
                         }
                         None => {
                             // 流结束，发送最终事件并写入 RESPONSE 日志
@@ -476,7 +483,7 @@ fn create_sse_stream(
                                 let stop_reason = ctx.state_manager.get_stop_reason();
                                 let input_tokens = ctx.context_input_tokens.unwrap_or(ctx.input_tokens);
                                 let entry = crate::api_logger::ApiLogger::format_response(
-                                    &ctx.message_id,
+                                    &request_id,
                                     &model_in,
                                     &model_kiro,
                                     &stop_reason,
@@ -491,7 +498,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, api_logger, model_in, model_kiro, start)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, api_logger, model_in, model_kiro, start, request_id)))
                         }
                     }
                 }
@@ -499,7 +506,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, api_logger, model_in, model_kiro, start)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, api_logger, model_in, model_kiro, start, request_id)))
                 }
             }
         },
@@ -512,6 +519,7 @@ fn create_sse_stream(
 use super::converter::get_context_window_size;
 
 /// 处理非流式请求
+#[allow(clippy::too_many_arguments)]
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -521,11 +529,12 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     api_logger: Option<Arc<crate::api_logger::ApiLogger>>,
+    request_id: &str,
 ) -> Response {
     // 写入 KIRO REQUEST 日志
     if let Some(ref logger) = api_logger {
         let entry = crate::api_logger::ApiLogger::format_kiro_request(
-            "pending",
+            request_id,
             &format!("https://q.*.amazonaws.com/generateAssistantResponse (model: {model_kiro})"),
             request_body,
         );
@@ -722,7 +731,7 @@ async fn handle_non_stream_request(
             .collect::<Vec<_>>()
             .join("");
         let entry = crate::api_logger::ApiLogger::format_response(
-            &msg_id,
+            request_id,
             model_in,
             model_kiro,
             &stop_reason,
@@ -902,10 +911,13 @@ pub async fn post_messages_cc(
     let model_kiro = crate::anthropic::converter::map_model(&model_in)
         .unwrap_or_else(|| model_in.clone());
 
+    // 为本次入站请求生成统一的日志追踪 ID，贯穿 REQUEST / KIRO REQUEST / RESPONSE 三行日志
+    let request_id = format!("msg_{}", Uuid::new_v4().to_string().replace('-', ""));
+
     // 写入 REQUEST 日志
     if let Some(ref logger) = state.api_logger {
         let entry = crate::api_logger::ApiLogger::format_request(
-            &format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+            &request_id,
             &model_in,
             &model_kiro,
             payload.stream,
@@ -944,12 +956,13 @@ pub async fn post_messages_cc(
             thinking_enabled,
             tool_name_map,
             api_logger,
+            &request_id,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &model_in, &model_kiro, input_tokens, extract_thinking, tool_name_map, api_logger).await
+        handle_non_stream_request(provider, &request_body, &model_in, &model_kiro, input_tokens, extract_thinking, tool_name_map, api_logger, &request_id).await
     }
 }
 
@@ -957,6 +970,7 @@ pub async fn post_messages_cc(
 ///
 /// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
 /// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -966,11 +980,12 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     api_logger: Option<Arc<crate::api_logger::ApiLogger>>,
+    request_id: &str,
 ) -> Response {
     // 写入 KIRO REQUEST 日志
     if let Some(ref logger) = api_logger {
         let entry = crate::api_logger::ApiLogger::format_kiro_request(
-            "pending",
+            request_id,
             &format!("https://q.*.amazonaws.com/generateAssistantResponse (model: {model_kiro})"),
             request_body,
         );
@@ -989,7 +1004,7 @@ async fn handle_stream_request_buffered(
     let ctx = BufferedStreamContext::new(model_in, estimated_input_tokens, thinking_enabled, tool_name_map);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, api_logger, model_in.to_string(), model_kiro.to_string(), start);
+    let stream = create_buffered_sse_stream(response, ctx, api_logger, model_in.to_string(), model_kiro.to_string(), start, request_id.to_string());
 
     // 返回 SSE 响应
     Response::builder()
@@ -1015,6 +1030,7 @@ fn create_buffered_sse_stream(
     model_in: String,
     model_kiro: String,
     start: Instant,
+    request_id: String,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1029,8 +1045,9 @@ fn create_buffered_sse_stream(
             model_in,
             model_kiro,
             start,
+            request_id,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, api_logger, model_in, model_kiro, start)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, api_logger, model_in, model_kiro, start, request_id)| async move {
             if finished {
                 return None;
             }
@@ -1045,7 +1062,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, api_logger, model_in, model_kiro, start)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, api_logger, model_in, model_kiro, start, request_id)));
                     }
 
                     // 然后处理数据流
@@ -1080,7 +1097,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, api_logger, model_in, model_kiro, start)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, api_logger, model_in, model_kiro, start, request_id)));
                             }
                             None => {
                                 // 流结束，写入 RESPONSE 日志，完成处理并返回所有事件
@@ -1089,7 +1106,7 @@ fn create_buffered_sse_stream(
                                     let stop_reason = ctx.inner.state_manager.get_stop_reason();
                                     let input_tokens = ctx.inner.context_input_tokens.unwrap_or(ctx.inner.input_tokens);
                                     let entry = crate::api_logger::ApiLogger::format_response(
-                                        &ctx.inner.message_id,
+                                        &request_id,
                                         &model_in,
                                         &model_kiro,
                                         &stop_reason,
@@ -1105,7 +1122,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, api_logger, model_in, model_kiro, start)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, api_logger, model_in, model_kiro, start, request_id)));
                             }
                         }
                     }
