@@ -87,6 +87,10 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                inflight: entry.inflight,
+                quota_reset_at: entry.quota_reset_at,
+                cooldown_until: entry.cooldown_until,
+                refresh_cooldown_until: entry.refresh_cooldown_until,
             })
             .collect();
 
@@ -235,6 +239,8 @@ impl AdminService {
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
+            quota_reset_at: None,
+            refresh_cooldown_until: None,
         };
 
         // 调用 token_manager 添加凭据

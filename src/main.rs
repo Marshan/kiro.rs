@@ -142,6 +142,8 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    // 启动后台恢复任务(60s 扫描 quota/refresh cooldown 到期凭据并兜底刷盘)
+    token_manager.spawn_recovery_task();
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),

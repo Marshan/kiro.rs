@@ -62,6 +62,18 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 飞行中请求数（实时负载指标）
+    #[serde(default)]
+    pub inflight: u32,
+    /// 配额恢复时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_reset_at: Option<String>,
+    /// 429 限速恢复时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<String>,
+    /// Token 刷新冷却恢复时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_cooldown_until: Option<String>,
 }
 
 // ============ 操作请求 ============

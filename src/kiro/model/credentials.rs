@@ -109,6 +109,20 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 配额到期时间 (RFC3339 格式)
+    ///
+    /// 当凭据因 402 MONTHLY_REQUEST_COUNT 被禁用时,记录 `getUsageLimits` 返回的
+    /// `nextDateReset`。后台恢复任务到点后自动重新启用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_reset_at: Option<String>,
+
+    /// Token 刷新冷却结束时间 (RFC3339 格式)
+    ///
+    /// 当凭据因连续刷新失败(`TooManyRefreshFailures`)被禁用时写入 `now + 30min`,
+    /// 后台任务到点后自动恢复。`invalid_grant` 导致的永久失效不使用此字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_cooldown_until: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -343,6 +357,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            quota_reset_at: None,
+            refresh_cooldown_until: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -461,6 +477,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            quota_reset_at: None,
+            refresh_cooldown_until: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -492,6 +510,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            quota_reset_at: None,
+            refresh_cooldown_until: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -606,6 +626,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            quota_reset_at: None,
+            refresh_cooldown_until: None,
         };
 
         let json = original.to_pretty_json().unwrap();

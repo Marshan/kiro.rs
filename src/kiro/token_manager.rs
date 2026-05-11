@@ -13,7 +13,8 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -52,6 +53,24 @@ fn sha256_hex(input: &str) -> String {
     hasher.update(input.as_bytes());
     let result = hasher.finalize();
     format!("{:x}", result)
+}
+
+/// 将 `Instant`(单调时钟)粗略换算为 `DateTime<Utc>` 并输出 RFC3339。
+///
+/// 粗略换算:`now_utc + (target_instant - now_instant)`。
+/// 误差在毫秒级,仅用于 Admin API 展示,不用于业务判断。
+fn instant_to_utc_rfc3339(instant: Option<Instant>) -> Option<String> {
+    let target = instant?;
+    let now_instant = Instant::now();
+    let now_utc = Utc::now();
+    let dt = if target >= now_instant {
+        let delta = target - now_instant;
+        now_utc + Duration::from_std(delta).ok()?
+    } else {
+        let delta = now_instant - target;
+        now_utc - Duration::from_std(delta).ok()?
+    };
+    Some(dt.to_rfc3339())
 }
 
 /// 生成 API Key 脱敏展示(前 4 + ... + 后 4,长度不足或非 ASCII 回退 ***)
@@ -414,6 +433,18 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 飞行中请求数（原子计数器，供 select_next_credential 使用）
+    inflight: Arc<AtomicU32>,
+    /// 上次 API 失败的时刻（用于失败计数的时间衰减）
+    last_failure_at: Option<Instant>,
+    /// 上次 Token 刷新失败的时刻（用于刷新失败计数的时间衰减）
+    last_refresh_failure_at: Option<Instant>,
+    /// 429 限速冷却结束时刻（优先使用 Retry-After；None 表示不在冷却中）
+    cooldown_until: Option<Instant>,
+    /// 配额重置时刻（仅当 disabled_reason=QuotaExceeded 时使用）
+    quota_reset_at: Option<DateTime<Utc>>,
+    /// Token 刷新冷却结束时刻（仅当 disabled_reason=TooManyRefreshFailures 时使用）
+    refresh_cooldown_until: Option<DateTime<Utc>>,
 }
 
 /// 禁用原因
@@ -487,6 +518,18 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 飞行中请求数（实时负载指标）
+    #[serde(default)]
+    pub inflight: u32,
+    /// 配额恢复时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_reset_at: Option<String>,
+    /// 429 限速恢复时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<String>,
+    /// Token 刷新冷却恢复时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_cooldown_until: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -526,12 +569,26 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 最近一次 credentials.json 持久化时间（用于 debounce）
+    last_credentials_save_at: Mutex<Option<Instant>>,
+    /// credentials 是否有未落盘更新
+    credentials_dirty: AtomicBool,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// 失败计数衰减窗口:超过此间隔后再次失败,计数先整除 2 再累加
+const FAILURE_DECAY_WINDOW: StdDuration = StdDuration::from_secs(600);
+/// credentials.json 持久化防抖间隔
+const CREDENTIALS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(5);
+/// 配额重置时间夹紧上限(45 天)
+const QUOTA_RESET_MAX: chrono::Duration = chrono::Duration::days(45);
+/// Refresh 失败冷却时长
+const REFRESH_FAILURE_COOLDOWN: chrono::Duration = chrono::Duration::minutes(30);
+/// 后台恢复任务扫描间隔
+const RECOVERY_SCAN_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
 /// API 调用上下文
 ///
@@ -545,6 +602,32 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+}
+
+/// 飞行中请求的 RAII 守卫
+///
+/// `acquire_context` 进入时对凭据的 `inflight` 计数 +1,Guard 被 Drop 时自动 -1。
+/// 调用方必须持有 Guard 到**请求完全结束**(含响应体读取/流式消费),否则计数会被提前释放。
+///
+/// Drop 是 panic-safe 的:即使持有者 panic,计数也会正确减 1。
+#[must_use = "InflightGuard 必须持有到请求完成,提前释放会让 inflight 计数失真"]
+pub struct InflightGuard {
+    inflight: Arc<AtomicU32>,
+    credential_id: u64,
+}
+
+impl InflightGuard {
+    /// 返回该 Guard 对应的凭据 ID(便于诊断)
+    #[allow(dead_code)]
+    pub fn credential_id(&self) -> u64 {
+        self.credential_id
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(1, Ordering::Release);
+    }
 }
 
 impl MultiTokenManager {
@@ -593,12 +676,33 @@ impl MultiTokenManager {
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
                     disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
+                        // 从持久化字段推断禁用原因,支撑后台自愈
+                        if cred.quota_reset_at.is_some() {
+                            Some(DisabledReason::QuotaExceeded)
+                        } else if cred.refresh_cooldown_until.is_some() {
+                            Some(DisabledReason::TooManyRefreshFailures)
+                        } else {
+                            Some(DisabledReason::Manual)
+                        }
                     } else {
                         None
                     },
                     success_count: 0,
                     last_used_at: None,
+                    inflight: Arc::new(AtomicU32::new(0)),
+                    last_failure_at: None,
+                    last_refresh_failure_at: None,
+                    cooldown_until: None,
+                    quota_reset_at: cred
+                        .quota_reset_at
+                        .as_deref()
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                        .map(|d| d.with_timezone(&Utc)),
+                    refresh_cooldown_until: cred
+                        .refresh_cooldown_until
+                        .as_deref()
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                        .map(|d| d.with_timezone(&Utc)),
                 }
             })
             .collect();
@@ -655,6 +759,8 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            last_credentials_save_at: Mutex::new(None),
+            credentials_dirty: AtomicBool::new(false),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -689,8 +795,9 @@ impl MultiTokenManager {
 
     /// 根据负载均衡模式选择下一个凭据
     ///
-    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
+    /// - priority 模式：按 `(cooldown_active, inflight, priority, last_used_at)` 四元组排序
+    ///   使同 priority 的凭据自动轮转,并优先挑选飞行请求数最少、未限速的
+    /// - balanced 模式：保持 Least-Used 行为(本次改动不动,后续独立 change 废弃)
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -726,8 +833,7 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
+                // 保留现有 Least-Used 行为(后续独立 change 废弃)
                 let entry = available
                     .iter()
                     .min_by_key(|e| (e.success_count, e.credentials.priority))?;
@@ -735,8 +841,23 @@ impl MultiTokenManager {
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
-                // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
+                // priority 模式：
+                // key = (cooldown 中降权, 飞行请求数, priority, 最近使用时间)
+                // - 未进入 cooldown 的凭据优先(false<true)
+                // - 飞行中请求数最少的优先(并发挤兑保护)
+                // - priority 数字小的优先(原有语义)
+                // - 最近使用时间最早的优先(同优先级轮转)
+                let now = Instant::now();
+                let entry = available.iter().min_by_key(|e| {
+                    let cooldown_active = e.cooldown_until.map(|t| t > now).unwrap_or(false);
+                    let inflight = e.inflight.load(Ordering::Relaxed);
+                    (
+                        cooldown_active,
+                        inflight,
+                        e.credentials.priority,
+                        e.last_used_at.clone(),
+                    )
+                })?;
                 Some((entry.id, entry.credentials.clone()))
             }
         }
@@ -744,15 +865,18 @@ impl MultiTokenManager {
 
     /// 获取 API 调用上下文
     ///
-    /// 返回绑定了 id、credentials 和 token 的调用上下文
-    /// 确保整个 API 调用过程中使用一致的凭据信息
+    /// 返回绑定了 id、credentials 和 token 的调用上下文,以及 RAII `InflightGuard`。
+    /// 调用方必须持有 Guard 到请求结束(含响应体/流式消费),Drop 时 inflight 自动 -1。
     ///
     /// 如果 Token 过期或即将过期，会自动刷新
     /// Token 刷新失败会累计到当前凭据，达到阈值后禁用并切换
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+    ) -> anyhow::Result<(CallContext, InflightGuard)> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -766,71 +890,72 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+            let (id, credentials, inflight_counter) = {
+                // priority/balanced 模式均按 select_next_credential 的排序规则选择。
+                // 不再依赖 current_id 粘性:priority 模式的"同优先级轮转"由
+                // (inflight, last_used_at) 二级键负责。current_id 仅用于 Admin UI 展示。
+                let mut best = self.select_next_credential(model);
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
-                    None
-                } else {
-                    let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
-                        .map(|e| (e.id, e.credentials.clone()))
-                };
-
-                if let Some(hit) = current_hit {
-                    hit
-                } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
-
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                    if best.is_none() {
-                        let mut entries = self.entries.lock();
-                        if entries.iter().any(|e| {
-                            e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
-                        }) {
-                            tracing::warn!(
-                                "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
-                            );
-                            for e in entries.iter_mut() {
-                                if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                                    e.disabled = false;
-                                    e.disabled_reason = None;
-                                    e.failure_count = 0;
-                                }
+                // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
+                if best.is_none() {
+                    let mut entries = self.entries.lock();
+                    if entries.iter().any(|e| {
+                        e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                    }) {
+                        tracing::warn!(
+                            "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
+                        );
+                        for e in entries.iter_mut() {
+                            if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                                e.disabled = false;
+                                e.disabled_reason = None;
+                                e.failure_count = 0;
                             }
-                            drop(entries);
-                            best = self.select_next_credential(model);
                         }
+                        drop(entries);
+                        best = self.select_next_credential(model);
                     }
+                }
 
-                    if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
-                        (new_id, new_creds)
-                    } else {
+                let (new_id, new_creds) = match best {
+                    Some(v) => v,
+                    None => {
                         let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
                         let available = entries.iter().filter(|e| !e.disabled).count();
                         anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     }
-                }
+                };
+
+                // inflight +1 并获取计数器的 Arc 句柄(供 Guard 构造)
+                let inflight_counter = {
+                    let entries = self.entries.lock();
+                    let entry = entries.iter().find(|e| e.id == new_id).ok_or_else(|| {
+                        anyhow::anyhow!("凭据 #{} 在选择后消失", new_id)
+                    })?;
+                    entry.inflight.fetch_add(1, Ordering::Acquire);
+                    Arc::clone(&entry.inflight)
+                };
+
+                // 更新 current_id(仅用于 Admin 展示)
+                *self.current_id.lock() = new_id;
+
+                (new_id, new_creds, inflight_counter)
+            };
+
+            // 构造 Guard(若 try_ensure_token 失败,Guard 离开作用域时自动 -1)
+            let guard = InflightGuard {
+                inflight: inflight_counter,
+                credential_id: id,
             };
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
-                    return Ok(ctx);
+                    return Ok((ctx, guard));
                 }
                 Err(e) => {
+                    // Drop guard 释放本次的 inflight
+                    drop(guard);
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available =
                         if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
@@ -1001,6 +1126,10 @@ impl MultiTokenManager {
                     cred.canonicalize_auth_method();
                     // 同步 disabled 状态到凭据对象
                     cred.disabled = e.disabled;
+                    // 同步 quota_reset_at / refresh_cooldown_until 到凭据对象
+                    cred.quota_reset_at = e.quota_reset_at.map(|t| t.to_rfc3339());
+                    cred.refresh_cooldown_until =
+                        e.refresh_cooldown_until.map(|t| t.to_rfc3339());
                     cred
                 })
                 .collect()
@@ -1019,6 +1148,210 @@ impl MultiTokenManager {
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
         Ok(true)
+    }
+
+    /// 防抖版本的凭据持久化
+    ///
+    /// - 标记 `credentials_dirty = true`
+    /// - 若距上次写入超过 `CREDENTIALS_SAVE_DEBOUNCE`,立即落盘并清除 dirty
+    /// - 否则什么都不做,等后台恢复任务或显式 flush 时兜底
+    fn persist_credentials_debounced(&self) {
+        self.credentials_dirty.store(true, Ordering::Release);
+
+        let should_flush = {
+            let mut last = self.last_credentials_save_at.lock();
+            let now = Instant::now();
+            let due = match *last {
+                Some(t) => now.duration_since(t) >= CREDENTIALS_SAVE_DEBOUNCE,
+                None => true,
+            };
+            if due {
+                *last = Some(now);
+            }
+            due
+        };
+
+        if should_flush {
+            self.flush_credentials_if_dirty();
+        }
+    }
+
+    /// 强制刷盘(若有 dirty 标记)
+    fn flush_credentials_if_dirty(&self) {
+        if !self.credentials_dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("凭据防抖刷盘失败: {}", e);
+            // 还原 dirty 标记,等下次再试
+            self.credentials_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// 标记凭据为短期 cooldown(用于 429 限流)
+    pub fn mark_cooldown(&self, id: u64, duration: StdDuration) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.cooldown_until = Some(Instant::now() + duration);
+            tracing::info!(
+                "凭据 #{} 标记 cooldown {} 秒(429 限流)",
+                id,
+                duration.as_secs()
+            );
+        }
+    }
+
+    /// 返回凭据剩余 cooldown 时长(若已到期或无 cooldown 返回 `None`)
+    pub fn cooldown_remaining_for(&self, id: u64) -> Option<StdDuration> {
+        let entries = self.entries.lock();
+        let entry = entries.iter().find(|e| e.id == id)?;
+        let until = entry.cooldown_until?;
+        let now = Instant::now();
+        if until > now {
+            Some(until - now)
+        } else {
+            None
+        }
+    }
+
+    /// 获取上游 next_date_reset 并记录为 quota_reset_at
+    ///
+    /// 失败时返回 `Ok(None)`,让上层决定是否 fallback 到永久禁用
+    pub async fn fetch_and_record_quota_reset(
+        &self,
+        id: u64,
+    ) -> Option<DateTime<Utc>> {
+        let usage = match self.get_usage_limits_for(id).await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(
+                    "凭据 #{} 402 后获取 getUsageLimits 失败: {},退化为永久禁用",
+                    id,
+                    e
+                );
+                return None;
+            }
+        };
+
+        let reset_at_ts = match usage.next_date_reset {
+            Some(t) => t,
+            None => {
+                tracing::warn!("凭据 #{} getUsageLimits 未返回 nextDateReset", id);
+                return None;
+            }
+        };
+
+        let reset_at = match DateTime::<Utc>::from_timestamp(reset_at_ts as i64, 0) {
+            Some(dt) => dt,
+            None => {
+                tracing::warn!(
+                    "凭据 #{} nextDateReset 时间戳非法: {}",
+                    id,
+                    reset_at_ts
+                );
+                return None;
+            }
+        };
+
+        // 夹紧到 [now, now + 45d]
+        let now = Utc::now();
+        let upper = now + QUOTA_RESET_MAX;
+        let clamped = reset_at.clamp(now, upper);
+        if clamped != reset_at {
+            tracing::info!(
+                "凭据 #{} nextDateReset={} 被夹紧到 {}",
+                id,
+                reset_at,
+                clamped
+            );
+        }
+        Some(clamped)
+    }
+
+    /// 扫描所有条目,将到期的 cooldown 类禁用凭据自动恢复
+    pub fn try_recover_expired_cooldowns(&self) {
+        let now_utc = Utc::now();
+        let mut recovered: Vec<u64> = Vec::new();
+
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                if !entry.disabled {
+                    continue;
+                }
+                match entry.disabled_reason {
+                    Some(DisabledReason::QuotaExceeded) => {
+                        if let Some(reset_at) = entry.quota_reset_at {
+                            if reset_at <= now_utc {
+                                entry.disabled = false;
+                                entry.disabled_reason = None;
+                                entry.failure_count = 0;
+                                entry.quota_reset_at = None;
+                                entry.credentials.disabled = false;
+                                entry.credentials.quota_reset_at = None;
+                                recovered.push(entry.id);
+                            }
+                        }
+                    }
+                    Some(DisabledReason::TooManyRefreshFailures) => {
+                        if let Some(reset_at) = entry.refresh_cooldown_until {
+                            if reset_at <= now_utc {
+                                entry.disabled = false;
+                                entry.disabled_reason = None;
+                                entry.refresh_failure_count = 0;
+                                entry.refresh_cooldown_until = None;
+                                entry.credentials.disabled = false;
+                                entry.credentials.refresh_cooldown_until = None;
+                                recovered.push(entry.id);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if !recovered.is_empty() {
+            for id in &recovered {
+                tracing::info!("凭据 #{} 冷却到期,已自动恢复", id);
+            }
+            self.persist_credentials_debounced();
+        }
+    }
+
+    /// 启动后台恢复任务
+    ///
+    /// 每 `RECOVERY_SCAN_INTERVAL` 扫描一次,恢复到期的 cooldown 凭据,
+    /// 并兜底刷盘 `credentials.json` 防抖队列。使用 `Arc::downgrade` 避免延长 Manager 生命周期。
+    pub fn spawn_recovery_task(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            tracing::info!(
+                "启动后台恢复任务(扫描间隔 {} 秒)",
+                RECOVERY_SCAN_INTERVAL.as_secs()
+            );
+            loop {
+                tokio::time::sleep(RECOVERY_SCAN_INTERVAL).await;
+                let manager = match weak.upgrade() {
+                    Some(m) => m,
+                    None => {
+                        tracing::info!("MultiTokenManager 已释放,后台恢复任务退出");
+                        break;
+                    }
+                };
+
+                // 单次迭代独立容错,避免异常杀掉整个任务
+                let result = std::panic::AssertUnwindSafe(async {
+                    manager.try_recover_expired_cooldowns();
+                    manager.flush_credentials_if_dirty();
+                });
+                if let Err(e) =
+                    futures::FutureExt::catch_unwind(result).await
+                {
+                    tracing::error!("后台恢复任务单次迭代 panic: {:?}", e);
+                }
+            }
+        });
     }
 
     /// 获取缓存目录（凭据文件所在目录）
@@ -1144,7 +1477,8 @@ impl MultiTokenManager {
 
     /// 报告指定凭据 API 调用失败
     ///
-    /// 增加失败计数，达到阈值时禁用凭据并切换到优先级最高的可用凭据
+    /// 增加失败计数（带时间衰减:距上次失败 >10 分钟则先整除 2 再累加 1），
+    /// 达到阈值时禁用凭据并切换到优先级最高的可用凭据。
     /// 返回是否还有可用凭据可以重试
     ///
     /// # Arguments
@@ -1163,7 +1497,14 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
+            // 时间衰减:距上次失败超过窗口则先整除 2
+            if let Some(last) = entry.last_failure_at {
+                if last.elapsed() > FAILURE_DECAY_WINDOW {
+                    entry.failure_count /= 2;
+                }
+            }
             entry.failure_count += 1;
+            entry.last_failure_at = Some(Instant::now());
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             let failure_count = entry.failure_count;
 
@@ -1206,9 +1547,18 @@ impl MultiTokenManager {
     ///
     /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
     /// - 立即禁用该凭据（不等待连续失败阈值）
+    /// - 记录 `quota_reset_at`(可选),后台任务到点后自动重启
     /// - 切换到下一个可用凭据继续重试
     /// - 返回是否还有可用凭据
-    pub fn report_quota_exhausted(&self, id: u64) -> bool {
+    ///
+    /// # Arguments
+    /// * `id` - 凭据 ID
+    /// * `quota_reset_at` - 配额重置时刻(来自 `getUsageLimits`);`None` 退化为永久禁用
+    pub fn report_quota_exhausted(
+        &self,
+        id: u64,
+        quota_reset_at: Option<DateTime<Utc>>,
+    ) -> bool {
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1228,7 +1578,26 @@ impl MultiTokenManager {
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
-            tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
+            // 夹紧 quota_reset_at 到 [now, now + 45d]
+            let clamped = quota_reset_at.map(|t| {
+                let now = Utc::now();
+                let max_future = now + Duration::days(45);
+                t.max(now).min(max_future)
+            });
+            entry.quota_reset_at = clamped;
+            entry.credentials.quota_reset_at = clamped.map(|t| t.to_rfc3339());
+
+            match clamped {
+                Some(t) => tracing::error!(
+                    "凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），{} 后自动恢复",
+                    id,
+                    t.to_rfc3339()
+                ),
+                None => tracing::error!(
+                    "凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），未知重置时间,永久禁用直至人工恢复",
+                    id
+                ),
+            }
 
             // 切换到优先级最高的可用凭据
             if let Some(next) = entries
@@ -1249,13 +1618,14 @@ impl MultiTokenManager {
             }
         };
         self.save_stats_debounced();
+        self.persist_credentials_debounced();
         result
     }
 
     /// 报告指定凭据刷新 Token 失败。
     ///
-    /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
-    /// 与 API 401/403 的累计失败策略保持一致。
+    /// 连续刷新失败达到阈值后禁用凭据并切换,并记录 30 分钟冷却时间供后台任务自愈。
+    /// 计数带时间衰减,与 API 失败策略保持一致。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
         let result = {
             let mut entries = self.entries.lock();
@@ -1271,7 +1641,15 @@ impl MultiTokenManager {
             }
 
             entry.last_used_at = Some(Utc::now().to_rfc3339());
+
+            // 时间衰减
+            if let Some(last) = entry.last_refresh_failure_at {
+                if last.elapsed() > FAILURE_DECAY_WINDOW {
+                    entry.refresh_failure_count /= 2;
+                }
+            }
             entry.refresh_failure_count += 1;
+            entry.last_refresh_failure_at = Some(Instant::now());
             let refresh_failure_count = entry.refresh_failure_count;
 
             tracing::warn!(
@@ -1287,11 +1665,15 @@ impl MultiTokenManager {
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+            let cooldown_until = Utc::now() + REFRESH_FAILURE_COOLDOWN;
+            entry.refresh_cooldown_until = Some(cooldown_until);
+            entry.credentials.refresh_cooldown_until = Some(cooldown_until.to_rfc3339());
 
             tracing::error!(
-                "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
+                "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用,{} 后自动重试",
                 id,
-                refresh_failure_count
+                refresh_failure_count,
+                cooldown_until.to_rfc3339()
             );
 
             if let Some(next) = entries
@@ -1312,6 +1694,7 @@ impl MultiTokenManager {
             }
         };
         self.save_stats_debounced();
+        self.persist_credentials_debounced();
         result
     }
 
@@ -1454,6 +1837,10 @@ impl MultiTokenManager {
                         DisabledReason::InvalidConfig => "InvalidConfig",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
+                    inflight: e.inflight.load(Ordering::Relaxed),
+                    quota_reset_at: e.quota_reset_at.map(|t| t.to_rfc3339()),
+                    cooldown_until: instant_to_utc_rfc3339(e.cooldown_until),
+                    refresh_cooldown_until: e.refresh_cooldown_until.map(|t| t.to_rfc3339()),
                 })
                 .collect(),
             current_id,
@@ -1757,6 +2144,12 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                inflight: Arc::new(AtomicU32::new(0)),
+                last_failure_at: None,
+                last_refresh_failure_at: None,
+                cooldown_until: None,
+                quota_reset_at: None,
+                refresh_cooldown_until: None,
             });
         }
 
@@ -2328,7 +2721,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let (ctx, _guard) = manager.acquire_context(None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -2350,7 +2743,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let (ctx, _guard) = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -2414,11 +2807,11 @@ mod tests {
 
         // 凭据会自动分配 ID（从 1 开始）
         assert_eq!(manager.available_count(), 2);
-        assert!(manager.report_quota_exhausted(1));
+        assert!(manager.report_quota_exhausted(1, None));
         assert_eq!(manager.available_count(), 1);
 
         // 再禁用第二个后，无可用凭据
-        assert!(!manager.report_quota_exhausted(2));
+        assert!(!manager.report_quota_exhausted(2, None));
         assert_eq!(manager.available_count(), 0);
     }
 
@@ -2431,8 +2824,8 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
-        manager.report_quota_exhausted(1);
-        manager.report_quota_exhausted(2);
+        manager.report_quota_exhausted(1, None);
+        manager.report_quota_exhausted(2, None);
         assert_eq!(manager.available_count(), 0);
 
         let err = manager.acquire_context(None).await.err().unwrap().to_string();
@@ -2595,5 +2988,171 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    // ============ 优先级切换优化相关测试 ============
+
+    #[tokio::test]
+    async fn test_select_same_priority_rotates_by_last_used_at() {
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.priority = 0;
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.priority = 0;
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred3 = KiroCredentials::default();
+        cred3.priority = 0;
+        cred3.access_token = Some("t3".to_string());
+        cred3.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2, cred3], None, None, false)
+                .unwrap();
+
+        // 串行触发 3 次成功,观察轮转
+        let (c1, g1) = manager.acquire_context(None).await.unwrap();
+        manager.report_success(c1.id);
+        drop(g1);
+        let (c2, g2) = manager.acquire_context(None).await.unwrap();
+        manager.report_success(c2.id);
+        drop(g2);
+        let (c3, g3) = manager.acquire_context(None).await.unwrap();
+        manager.report_success(c3.id);
+        drop(g3);
+
+        let mut seen = vec![c1.id, c2.id, c3.id];
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "同优先级 3 张凭据应该被轮转使用,实际: {:?}", [c1.id, c2.id, c3.id]);
+    }
+
+    #[tokio::test]
+    async fn test_select_balances_by_inflight() {
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.priority = 0;
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.priority = 0;
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 持有 cred1 的 guard,下次 select 应该挑 cred2
+        let (c1, _g1) = manager.acquire_context(None).await.unwrap();
+        let (c2, _g2) = manager.acquire_context(None).await.unwrap();
+        assert_ne!(c1.id, c2.id, "inflight 更少的凭据应被优先选择");
+    }
+
+    #[tokio::test]
+    async fn test_inflight_guard_decrements_on_drop() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.priority = 0;
+        cred.access_token = Some("t".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        {
+            let (_ctx, _guard) = manager.acquire_context(None).await.unwrap();
+            let snapshot = manager.snapshot();
+            assert_eq!(snapshot.entries[0].inflight, 1);
+        }
+        // guard 被 drop 后,inflight 应回到 0
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].inflight, 0);
+    }
+
+    #[tokio::test]
+    async fn test_429_cooldown_skips_rate_limited_credential() {
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.priority = 0;
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.priority = 0;
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 标记 cred1 cooldown,下次 select 应该挑 cred2(因 cred2 cooldown_active=false 优先)
+        manager.mark_cooldown(1, StdDuration::from_secs(60));
+        let (ctx, _g) = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2);
+    }
+
+    #[test]
+    fn test_quota_reset_at_recovers_credential() {
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // 人工设置过期 quota_reset_at + 禁用
+        {
+            let mut entries = manager.entries.lock();
+            let e = &mut entries[0];
+            e.disabled = true;
+            e.disabled_reason = Some(DisabledReason::QuotaExceeded);
+            e.quota_reset_at = Some(Utc::now() - Duration::minutes(5)); // 5 分钟前
+        }
+
+        manager.try_recover_expired_cooldowns();
+
+        let snapshot = manager.snapshot();
+        assert!(!snapshot.entries[0].disabled, "过期 quota_reset_at 的凭据应被恢复");
+        assert!(snapshot.entries[0].quota_reset_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_invalid_refresh_token_never_recovers() {
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // 标记 InvalidRefreshToken 禁用
+        {
+            let mut entries = manager.entries.lock();
+            let e = &mut entries[0];
+            e.disabled = true;
+            e.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+        }
+
+        manager.try_recover_expired_cooldowns();
+
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled, "InvalidRefreshToken 不自愈");
+    }
+
+    #[test]
+    fn test_refresh_cooldown_30min_auto_recover() {
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // 过期的 refresh_cooldown_until
+        {
+            let mut entries = manager.entries.lock();
+            let e = &mut entries[0];
+            e.disabled = true;
+            e.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+            e.refresh_failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            e.refresh_cooldown_until = Some(Utc::now() - Duration::minutes(1));
+        }
+
+        manager.try_recover_expired_cooldowns();
+
+        let snapshot = manager.snapshot();
+        assert!(!snapshot.entries[0].disabled);
+        assert_eq!(snapshot.entries[0].refresh_failure_count, 0);
     }
 }

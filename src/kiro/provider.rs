@@ -134,13 +134,23 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let (ctx, _guard) = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            // "全员 cooldown"兜底:若 select 返回的凭据自身仍在 cooldown,对剩余时长 sleep
+            if let Some(remaining) = self.token_manager.cooldown_remaining_for(ctx.id) {
+                tracing::info!(
+                    "凭据 #{} 仍在 cooldown,等待 {:.1}s 后重试(所有凭据均被限流)",
+                    ctx.id,
+                    remaining.as_secs_f32()
+                );
+                sleep(remaining).await;
+            }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -208,7 +218,13 @@ impl KiroProvider {
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                let quota_reset_at = self
+                    .token_manager
+                    .fetch_and_record_quota_reset(ctx.id)
+                    .await;
+                let has_available = self
+                    .token_manager
+                    .report_quota_exhausted(ctx.id, quota_reset_at);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -252,12 +268,13 @@ impl KiroProvider {
                     body
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-                if attempt + 1 < max_retries {
-                    let delay = if status.as_u16() == 429 {
-                        Self::retry_delay_rate_limited(attempt, retry_after_secs)
-                    } else {
-                        Self::retry_delay(attempt)
-                    };
+                if status.as_u16() == 429 {
+                    // 标记 cooldown,下次 select 自动跳过;不 sleep
+                    let cooldown_secs = retry_after_secs.unwrap_or(30).min(120);
+                    self.token_manager
+                        .mark_cooldown(ctx.id, Duration::from_secs(cooldown_secs));
+                } else if attempt + 1 < max_retries {
+                    let delay = Self::retry_delay(attempt);
                     tracing::info!("等待 {:.1}s 后重试", delay.as_secs_f32());
                     sleep(delay).await;
                 }
@@ -303,13 +320,23 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let (ctx, _guard) = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            // "全员 cooldown"兜底:若 select 返回的凭据自身仍在 cooldown,对剩余时长 sleep
+            if let Some(remaining) = self.token_manager.cooldown_remaining_for(ctx.id) {
+                tracing::info!(
+                    "凭据 #{} 仍在 cooldown,等待 {:.1}s 后重试(所有凭据均被限流)",
+                    ctx.id,
+                    remaining.as_secs_f32()
+                );
+                sleep(remaining).await;
+            }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -387,7 +414,13 @@ impl KiroProvider {
                     body
                 );
 
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                let quota_reset_at = self
+                    .token_manager
+                    .fetch_and_record_quota_reset(ctx.id)
+                    .await;
+                let has_available = self
+                    .token_manager
+                    .report_quota_exhausted(ctx.id, quota_reset_at);
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -467,12 +500,13 @@ impl KiroProvider {
                     status,
                     body
                 ));
-                if attempt + 1 < max_retries {
-                    let delay = if status.as_u16() == 429 {
-                        Self::retry_delay_rate_limited(attempt, retry_after_secs)
-                    } else {
-                        Self::retry_delay(attempt)
-                    };
+                if status.as_u16() == 429 {
+                    // 标记 cooldown,下次 select 自动跳过当前凭据;不 sleep
+                    let cooldown_secs = retry_after_secs.unwrap_or(30).min(120);
+                    self.token_manager
+                        .mark_cooldown(ctx.id, Duration::from_secs(cooldown_secs));
+                } else if attempt + 1 < max_retries {
+                    let delay = Self::retry_delay(attempt);
                     tracing::info!("等待 {:.1}s 后重试", delay.as_secs_f32());
                     sleep(delay).await;
                 }
@@ -536,20 +570,6 @@ impl KiroProvider {
         let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
         let backoff = exp.min(MAX_MS);
         let jitter_max = (backoff / 4).max(1);
-        let jitter = fastrand::u64(0..=jitter_max);
-        Duration::from_millis(backoff.saturating_add(jitter))
-    }
-
-    /// 429 限流专用退避：基础 5s，上限 60s
-    fn retry_delay_rate_limited(attempt: usize, retry_after_secs: Option<u64>) -> Duration {
-        if let Some(secs) = retry_after_secs {
-            return Duration::from_secs(secs.min(120));
-        }
-        const BASE_MS: u64 = 5_000;
-        const MAX_MS: u64 = 60_000;
-        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(4) as u32));
-        let backoff = exp.min(MAX_MS);
-        let jitter_max = (backoff / 5).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
     }
