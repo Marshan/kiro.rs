@@ -234,6 +234,14 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                tracing::error!(
+                    credential_id = ctx.id,
+                    endpoint = endpoint.name(),
+                    profile_arn = ctx.credentials.profile_arn.as_deref().unwrap_or("<none>"),
+                    status = %status,
+                    body = %body,
+                    "MCP 400 失败（按设计不重试不切换）"
+                );
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
@@ -441,6 +449,14 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                tracing::error!(
+                    credential_id = ctx.id,
+                    endpoint = endpoint.name(),
+                    profile_arn = ctx.credentials.profile_arn.as_deref().unwrap_or("<none>"),
+                    status = %status,
+                    body = %body,
+                    "API 400 失败（按设计不重试不切换）"
+                );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
