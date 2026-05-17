@@ -532,6 +532,18 @@ pub struct MultiTokenManager {
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+const LOAD_BALANCING_MODE_PRIORITY: &str = "priority";
+const LOAD_BALANCING_MODE_BALANCED: &str = "balanced";
+const LOAD_BALANCING_MODE_ROUND_ROBIN: &str = "round_robin";
+
+fn normalize_load_balancing_mode(mode: &str) -> Option<&'static str> {
+    match mode {
+        LOAD_BALANCING_MODE_PRIORITY => Some(LOAD_BALANCING_MODE_PRIORITY),
+        LOAD_BALANCING_MODE_BALANCED => Some(LOAD_BALANCING_MODE_BALANCED),
+        LOAD_BALANCING_MODE_ROUND_ROBIN | "round-robin" => Some(LOAD_BALANCING_MODE_ROUND_ROBIN),
+        _ => None,
+    }
+}
 
 /// API 调用上下文
 ///
@@ -635,15 +647,31 @@ impl MultiTokenManager {
             anyhow::bail!("检测到重复的凭据 ID: {:?}", duplicate_ids);
         }
 
-        // 选择初始凭据：优先级最高（priority 最小）的可用凭据，无可用凭据时为 0
-        let initial_id = entries
-            .iter()
-            .filter(|e| !e.disabled)
-            .min_by_key(|e| e.credentials.priority)
-            .map(|e| e.id)
-            .unwrap_or(0);
+        let load_balancing_mode = match normalize_load_balancing_mode(&config.load_balancing_mode) {
+            Some(mode) => mode.to_string(),
+            None => {
+                tracing::warn!(
+                    "负载均衡模式 {} 无效，使用默认模式 {}",
+                    config.load_balancing_mode,
+                    LOAD_BALANCING_MODE_ROUND_ROBIN
+                );
+                LOAD_BALANCING_MODE_ROUND_ROBIN.to_string()
+            }
+        };
 
-        let load_balancing_mode = config.load_balancing_mode.clone();
+        // round_robin 模式下 current_id 表示上一次选择的凭据；0 表示尚未选择。
+        // 其他模式保留旧行为：初始指向优先级最高的可用凭据。
+        let initial_id = if load_balancing_mode == LOAD_BALANCING_MODE_ROUND_ROBIN {
+            0
+        } else {
+            entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+                .map(|e| e.id)
+                .unwrap_or(0)
+        };
+
         let manager = Self {
             config,
             proxy,
@@ -689,6 +717,7 @@ impl MultiTokenManager {
 
     /// 根据负载均衡模式选择下一个凭据
     ///
+    /// - round_robin 模式：按凭据列表顺序轮询所有未禁用凭据
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
     /// - balanced 模式：均衡选择可用凭据
     ///
@@ -696,6 +725,14 @@ impl MultiTokenManager {
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
+        let mode = self.load_balancing_mode.lock().clone();
+        let mode = mode.as_str();
+
+        if mode == LOAD_BALANCING_MODE_ROUND_ROBIN {
+            let current_id = *self.current_id.lock();
+            return Self::select_round_robin_entry(&entries, current_id)
+                .map(|entry| (entry.id, entry.credentials.clone()));
+        }
 
         // 检查是否是 opus 模型
         let is_opus = model
@@ -721,11 +758,8 @@ impl MultiTokenManager {
             return None;
         }
 
-        let mode = self.load_balancing_mode.lock().clone();
-        let mode = mode.as_str();
-
         match mode {
-            "balanced" => {
+            LOAD_BALANCING_MODE_BALANCED => {
                 // Least-Used 策略：选择成功次数最少的凭据
                 // 平局时按优先级排序（数字越小优先级越高）
                 let entry = available
@@ -735,11 +769,36 @@ impl MultiTokenManager {
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
-                // priority 模式（默认）：选择优先级最高的
+                // priority 模式：选择优先级最高的
                 let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
                 Some((entry.id, entry.credentials.clone()))
             }
         }
+    }
+
+    fn select_round_robin_entry(
+        entries: &[CredentialEntry],
+        current_id: u64,
+    ) -> Option<&CredentialEntry> {
+        if entries.is_empty() {
+            return None;
+        }
+
+        let start = entries
+            .iter()
+            .position(|e| e.id == current_id)
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+
+        for offset in 0..entries.len() {
+            let idx = (start + offset) % entries.len();
+            let entry = &entries[idx];
+            if !entry.disabled {
+                return Some(entry);
+            }
+        }
+
+        None
     }
 
     /// 获取 API 调用上下文
@@ -767,25 +826,26 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                let mode = self.load_balancing_mode.lock().clone();
+                let uses_current = mode.as_str() == LOAD_BALANCING_MODE_PRIORITY;
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
+                // round_robin/balanced 模式：每次请求都重新选择。
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
-                    None
-                } else {
+                let current_hit = if uses_current {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
                         .find(|e| e.id == current_id && !e.disabled)
                         .map(|e| (e.id, e.credentials.clone()))
+                } else {
+                    None
                 };
 
                 if let Some(hit) = current_hit {
                     hit
                 } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
+                    // 当前凭据不可用，或 round_robin/balanced 模式需要重新选择
                     let mut best = self.select_next_credential(model);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
@@ -1150,6 +1210,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
+        let mode = self.get_load_balancing_mode();
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1179,20 +1240,24 @@ impl MultiTokenManager {
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
-                // 切换到优先级最高的可用凭据
-                if let Some(next) = entries
-                    .iter()
-                    .filter(|e| !e.disabled)
-                    .min_by_key(|e| e.credentials.priority)
-                {
-                    *current_id = next.id;
-                    tracing::info!(
-                        "已切换到凭据 #{}（优先级 {}）",
-                        next.id,
-                        next.credentials.priority
-                    );
+                if mode == LOAD_BALANCING_MODE_ROUND_ROBIN {
+                    tracing::info!("round_robin 模式保留当前游标，下一次请求将轮询到后续凭据");
                 } else {
-                    tracing::error!("所有凭据均已禁用！");
+                    // 切换到优先级最高的可用凭据
+                    if let Some(next) = entries
+                        .iter()
+                        .filter(|e| !e.disabled)
+                        .min_by_key(|e| e.credentials.priority)
+                    {
+                        *current_id = next.id;
+                        tracing::info!(
+                            "已切换到凭据 #{}（优先级 {}）",
+                            next.id,
+                            next.credentials.priority
+                        );
+                    } else {
+                        tracing::error!("所有凭据均已禁用！");
+                    }
                 }
             }
 
@@ -1209,6 +1274,7 @@ impl MultiTokenManager {
     /// - 切换到下一个可用凭据继续重试
     /// - 返回是否还有可用凭据
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
+        let mode = self.get_load_balancing_mode();
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1230,22 +1296,30 @@ impl MultiTokenManager {
 
             tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
 
-            // 切换到优先级最高的可用凭据
-            if let Some(next) = entries
-                .iter()
-                .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
-            {
-                *current_id = next.id;
-                tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
-                    next.id,
-                    next.credentials.priority
-                );
-                true
+            if mode == LOAD_BALANCING_MODE_ROUND_ROBIN {
+                let has_available = entries.iter().any(|e| !e.disabled);
+                if !has_available {
+                    tracing::error!("所有凭据均已禁用！");
+                }
+                has_available
             } else {
-                tracing::error!("所有凭据均已禁用！");
-                false
+                // 切换到优先级最高的可用凭据
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|e| !e.disabled)
+                    .min_by_key(|e| e.credentials.priority)
+                {
+                    *current_id = next.id;
+                    tracing::info!(
+                        "已切换到凭据 #{}（优先级 {}）",
+                        next.id,
+                        next.credentials.priority
+                    );
+                    true
+                } else {
+                    tracing::error!("所有凭据均已禁用！");
+                    false
+                }
             }
         };
         self.save_stats_debounced();
@@ -1257,6 +1331,7 @@ impl MultiTokenManager {
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
     /// 与 API 401/403 的累计失败策略保持一致。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
+        let mode = self.get_load_balancing_mode();
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1294,21 +1369,29 @@ impl MultiTokenManager {
                 refresh_failure_count
             );
 
-            if let Some(next) = entries
-                .iter()
-                .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
-            {
-                *current_id = next.id;
-                tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
-                    next.id,
-                    next.credentials.priority
-                );
-                true
+            if mode == LOAD_BALANCING_MODE_ROUND_ROBIN {
+                let has_available = entries.iter().any(|e| !e.disabled);
+                if !has_available {
+                    tracing::error!("所有凭据均已禁用！");
+                }
+                has_available
             } else {
-                tracing::error!("所有凭据均已禁用！");
-                false
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|e| !e.disabled)
+                    .min_by_key(|e| e.credentials.priority)
+                {
+                    *current_id = next.id;
+                    tracing::info!(
+                        "已切换到凭据 #{}（优先级 {}）",
+                        next.id,
+                        next.credentials.priority
+                    );
+                    true
+                } else {
+                    tracing::error!("所有凭据均已禁用！");
+                    false
+                }
             }
         };
         self.save_stats_debounced();
@@ -1320,6 +1403,7 @@ impl MultiTokenManager {
     /// 立即禁用凭据，不累计、不重试。
     /// 返回是否还有可用凭据。
     pub fn report_refresh_token_invalid(&self, id: u64) -> bool {
+        let mode = self.get_load_balancing_mode();
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1342,33 +1426,48 @@ impl MultiTokenManager {
                 id
             );
 
-            if let Some(next) = entries
-                .iter()
-                .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
-            {
-                *current_id = next.id;
-                tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
-                    next.id,
-                    next.credentials.priority
-                );
-                true
+            if mode == LOAD_BALANCING_MODE_ROUND_ROBIN {
+                let has_available = entries.iter().any(|e| !e.disabled);
+                if !has_available {
+                    tracing::error!("所有凭据均已禁用！");
+                }
+                has_available
             } else {
-                tracing::error!("所有凭据均已禁用！");
-                false
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|e| !e.disabled)
+                    .min_by_key(|e| e.credentials.priority)
+                {
+                    *current_id = next.id;
+                    tracing::info!(
+                        "已切换到凭据 #{}（优先级 {}）",
+                        next.id,
+                        next.credentials.priority
+                    );
+                    true
+                } else {
+                    tracing::error!("所有凭据均已禁用！");
+                    false
+                }
             }
         };
         self.save_stats_debounced();
         result
     }
 
-    /// 切换到优先级最高的可用凭据
+    /// 切换到下一个可用凭据
     ///
     /// 返回是否成功切换
     pub fn switch_to_next(&self) -> bool {
+        let mode = self.get_load_balancing_mode();
         let entries = self.entries.lock();
         let mut current_id = self.current_id.lock();
+
+        if mode == LOAD_BALANCING_MODE_ROUND_ROBIN {
+            // round_robin 的 current_id 是“上一次使用”的游标。
+            // 不在这里预先推进，避免下一次 acquire_context 再次推进时跳过凭据。
+            return entries.iter().any(|e| !e.disabled);
+        }
 
         // 选择优先级最高的未禁用凭据（排除当前凭据）
         if let Some(next) = entries
@@ -1397,6 +1496,11 @@ impl MultiTokenManager {
     pub fn snapshot(&self) -> ManagerSnapshot {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
+        let visible_current_id = if entries.iter().any(|e| e.id == current_id && !e.disabled) {
+            current_id
+        } else {
+            0
+        };
         let available = entries.iter().filter(|e| !e.disabled).count();
 
         ManagerSnapshot {
@@ -1456,7 +1560,7 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                 })
                 .collect(),
-            current_id,
+            current_id: visible_current_id,
             total: entries.len(),
             available,
         }
@@ -1498,8 +1602,10 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.credentials.priority = priority;
         }
-        // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
-        self.select_highest_priority();
+        // priority 模式下立即按新优先级重新选择当前凭据。
+        if self.get_load_balancing_mode() == LOAD_BALANCING_MODE_PRIORITY {
+            self.select_highest_priority();
+        }
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
@@ -1776,7 +1882,7 @@ impl MultiTokenManager {
     /// 1. 验证凭据存在
     /// 2. 验证凭据已禁用
     /// 3. 从 entries 移除
-    /// 4. 如果删除的是当前凭据，切换到优先级最高的可用凭据
+    /// 4. 如果删除的是当前凭据，按当前模式重置游标
     /// 5. 如果删除后没有凭据，将 current_id 重置为 0
     /// 6. 持久化到文件
     ///
@@ -1808,9 +1914,13 @@ impl MultiTokenManager {
             was_current
         };
 
-        // 如果删除的是当前凭据，切换到优先级最高的可用凭据
+        // 如果删除的是当前凭据，按当前模式重置游标
         if was_current {
-            self.select_highest_priority();
+            if self.get_load_balancing_mode() == LOAD_BALANCING_MODE_PRIORITY {
+                self.select_highest_priority();
+            } else {
+                *self.current_id.lock() = 0;
+            }
         }
 
         // 如果删除后没有任何凭据，将 current_id 重置为 0（与初始化行为保持一致）
@@ -1901,10 +2011,12 @@ impl MultiTokenManager {
 
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
-        // 验证模式值
-        if mode != "priority" && mode != "balanced" {
-            anyhow::bail!("无效的负载均衡模式: {}", mode);
-        }
+        let mode = match normalize_load_balancing_mode(&mode) {
+            Some(mode) => mode.to_string(),
+            None => {
+                anyhow::bail!("无效的负载均衡模式: {}", mode);
+            }
+        };
 
         let previous_mode = self.get_load_balancing_mode();
         if previous_mode == mode {
@@ -1916,6 +2028,12 @@ impl MultiTokenManager {
         if let Err(err) = self.persist_load_balancing_mode(&mode) {
             *self.load_balancing_mode.lock() = previous_mode;
             return Err(err);
+        }
+
+        if mode == LOAD_BALANCING_MODE_PRIORITY {
+            self.select_highest_priority();
+        } else if mode == LOAD_BALANCING_MODE_ROUND_ROBIN {
+            *self.current_id.lock() = 0;
         }
 
         tracing::info!("负载均衡模式已设置为: {}", mode);
@@ -1934,6 +2052,13 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_credentials(token: &str) -> KiroCredentials {
+        let mut credentials = KiroCredentials::default();
+        credentials.access_token = Some(token.to_string());
+        credentials.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        credentials
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
@@ -2259,7 +2384,8 @@ mod tests {
 
     #[test]
     fn test_multi_token_manager_switch_to_next() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.load_balancing_mode = LOAD_BALANCING_MODE_PRIORITY.to_string();
         let mut cred1 = KiroCredentials::default();
         cred1.refresh_token = Some("token1".to_string());
         let mut cred2 = KiroCredentials::default();
@@ -2302,6 +2428,93 @@ mod tests {
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
 
         std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_round_robin_is_default_and_rotates() {
+        let config = Config::default();
+        assert_eq!(config.load_balancing_mode, LOAD_BALANCING_MODE_ROUND_ROBIN);
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_credentials("token-1"),
+                valid_credentials("token-2"),
+                valid_credentials("token-3"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.acquire_context(None).await.unwrap().id, 1);
+        assert_eq!(manager.acquire_context(None).await.unwrap().id, 2);
+        assert_eq!(manager.acquire_context(None).await.unwrap().id, 3);
+        assert_eq!(manager.acquire_context(None).await.unwrap().id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_round_robin_failure_uses_next_credential() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![valid_credentials("token-1"), valid_credentials("token-2")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let first = manager.acquire_context(None).await.unwrap();
+        assert_eq!(first.id, 1);
+        assert!(manager.report_failure(first.id));
+
+        let second = manager.acquire_context(None).await.unwrap();
+        assert_eq!(second.id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_round_robin_skips_disabled_without_skipping_next() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_credentials("token-1"),
+                valid_credentials("token-2"),
+                valid_credentials("token-3"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let first = manager.acquire_context(None).await.unwrap();
+        assert_eq!(first.id, 1);
+        assert!(manager.report_quota_exhausted(first.id));
+
+        let second = manager.acquire_context(None).await.unwrap();
+        assert_eq!(second.id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_round_robin_only_filters_disabled_credentials() {
+        let config = Config::default();
+        let mut free_credential = valid_credentials("token-1");
+        free_credential.subscription_title = Some("KIRO FREE".to_string());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![free_credential, valid_credentials("token-2")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let ctx = manager.acquire_context(Some("claude-opus")).await.unwrap();
+        assert_eq!(ctx.id, 1);
     }
 
     #[tokio::test]
@@ -2357,7 +2570,8 @@ mod tests {
 
     #[test]
     fn test_multi_token_manager_report_refresh_failure() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.load_balancing_mode = LOAD_BALANCING_MODE_PRIORITY.to_string();
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 

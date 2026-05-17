@@ -286,9 +286,12 @@ impl AdminService {
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
         // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
+        if !matches!(
+            req.mode.as_str(),
+            "round_robin" | "round-robin" | "priority" | "balanced"
+        ) {
             return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority' 或 'balanced'".to_string(),
+                "mode 必须是 'round_robin'、'priority' 或 'balanced'".to_string(),
             ));
         }
 
@@ -296,7 +299,9 @@ impl AdminService {
             .set_load_balancing_mode(req.mode.clone())
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
-        Ok(LoadBalancingModeResponse { mode: req.mode })
+        Ok(LoadBalancingModeResponse {
+            mode: self.token_manager.get_load_balancing_mode(),
+        })
     }
 
     /// 强制刷新指定凭据的 Token

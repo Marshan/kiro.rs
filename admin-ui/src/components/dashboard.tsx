@@ -15,10 +15,23 @@ import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { BalanceResponse } from '@/types/api'
+import type { BalanceResponse, LoadBalancingMode } from '@/types/api'
 
 interface DashboardProps {
   onLogout: () => void
+}
+
+const LOAD_BALANCING_MODES: LoadBalancingMode[] = ['round_robin', 'priority', 'balanced']
+
+const LOAD_BALANCING_LABELS: Record<LoadBalancingMode, string> = {
+  round_robin: '轮询模式',
+  priority: '优先级模式',
+  balanced: '均衡负载',
+}
+
+function nextLoadBalancingMode(currentMode: LoadBalancingMode): LoadBalancingMode {
+  const index = LOAD_BALANCING_MODES.indexOf(currentMode)
+  return LOAD_BALANCING_MODES[(index + 1) % LOAD_BALANCING_MODES.length]
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
@@ -493,12 +506,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 切换负载均衡模式
   const handleToggleLoadBalancing = () => {
-    const currentMode = loadBalancingData?.mode || 'priority'
-    const newMode = currentMode === 'priority' ? 'balanced' : 'priority'
+    const currentMode = loadBalancingData?.mode || 'round_robin'
+    const newMode = nextLoadBalancingMode(currentMode)
 
     setLoadBalancingMode(newMode, {
       onSuccess: () => {
-        const modeName = newMode === 'priority' ? '优先级模式' : '均衡负载模式'
+        const modeName = LOAD_BALANCING_LABELS[newMode]
         toast.success(`已切换到${modeName}`)
       },
       onError: (error) => {
@@ -550,9 +563,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
               size="sm"
               onClick={handleToggleLoadBalancing}
               disabled={isLoadingMode || isSettingMode}
-              title="切换负载均衡模式"
+              title="切换负载均衡模式：轮询模式 / 优先级模式 / 均衡负载"
             >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
+              {isLoadingMode ? '加载中...' : LOAD_BALANCING_LABELS[loadBalancingData?.mode || 'round_robin']}
             </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}

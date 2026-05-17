@@ -46,6 +46,8 @@ export interface SuccessResponse {
   message: string
 }
 
+export type LoadBalancingMode = 'round_robin' | 'priority' | 'balanced'
+
 // 错误响应
 export interface AdminErrorResponse {
   error: {

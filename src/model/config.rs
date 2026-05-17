@@ -87,7 +87,7 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
-    /// 负载均衡模式（"priority" 或 "balanced"）
+    /// 负载均衡模式（"round_robin"、"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
@@ -148,7 +148,7 @@ fn default_tls_backend() -> TlsBackend {
 }
 
 fn default_load_balancing_mode() -> String {
-    "priority".to_string()
+    "round_robin".to_string()
 }
 
 fn default_extract_thinking() -> bool {
