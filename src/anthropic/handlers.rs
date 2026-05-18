@@ -199,13 +199,6 @@ pub async fn post_messages(
     State(state): State<AppState>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
-    tracing::info!(
-        model = %payload.model,
-        max_tokens = %payload.max_tokens,
-        stream = %payload.stream,
-        message_count = %payload.messages.len(),
-        "Received POST /v1/messages request"
-    );
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -265,6 +258,15 @@ pub async fn post_messages(
     let model_in = payload.model.clone();
     let model_kiro = crate::anthropic::converter::map_model(&model_in)
         .unwrap_or_else(|| model_in.clone());
+
+    tracing::info!(
+        model = %payload.model,
+        kiro_model = %model_kiro,
+        max_tokens = %payload.max_tokens,
+        stream = %payload.stream,
+        message_count = %payload.messages.len(),
+        "Received POST /v1/messages request"
+    );
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {

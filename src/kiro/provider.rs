@@ -125,6 +125,11 @@ impl KiroProvider {
         self.call_mcp_with_retry(request_body).await
     }
 
+    /// 判断 429 响应体是否为 Kiro 的"可疑活动"封禁（区别于容量不足）
+    fn is_suspicious_activity_429(body: &str) -> bool {
+        body.contains("suspicious activity")
+    }
+
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
@@ -141,6 +146,12 @@ impl KiroProvider {
                     continue;
                 }
             };
+
+            tracing::info!(
+                credential_id = ctx.id,
+                "凭据 #{} 开始 MCP 请求",
+                ctx.id
+            );
 
             // "全员 cooldown"兜底:若 select 返回的凭据自身仍在 cooldown,对剩余时长 sleep
             if let Some(remaining) = self.token_manager.cooldown_remaining_for(ctx.id) {
@@ -268,23 +279,49 @@ impl KiroProvider {
 
             // 瞬态错误
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
-                tracing::warn!(
-                    "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if status.as_u16() == 429 {
-                    // 标记 cooldown,下次 select 自动跳过;不 sleep
-                    let cooldown_secs = retry_after_secs.unwrap_or(30).min(120);
-                    self.token_manager
-                        .mark_cooldown(ctx.id, Duration::from_secs(cooldown_secs));
-                } else if attempt + 1 < max_retries {
-                    let delay = Self::retry_delay(attempt);
-                    tracing::info!("等待 {:.1}s 后重试", delay.as_secs_f32());
-                    sleep(delay).await;
+                    if Self::is_suspicious_activity_429(&body) {
+                        let cooldown_secs = retry_after_secs.unwrap_or(600).min(600);
+                        tracing::warn!(
+                            credential_id = ctx.id,
+                            "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
+                            attempt + 1,
+                            max_retries,
+                            status,
+                            body
+                        );
+                        self.token_manager
+                            .mark_cooldown(ctx.id, Duration::from_secs(cooldown_secs));
+                        tracing::info!("凭据 #{} 标记 cooldown {} 秒(可疑活动限流)", ctx.id, cooldown_secs);
+                        self.token_manager.report_failure(ctx.id);
+                    } else {
+                        let cooldown_secs = retry_after_secs.unwrap_or(30).min(120);
+                        tracing::warn!(
+                            credential_id = ctx.id,
+                            "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
+                            attempt + 1,
+                            max_retries,
+                            status,
+                            body
+                        );
+                        self.token_manager
+                            .mark_cooldown(ctx.id, Duration::from_secs(cooldown_secs));
+                        tracing::info!("凭据 #{} 标记 cooldown {} 秒(容量不足限流)", ctx.id, cooldown_secs);
+                    }
+                } else {
+                    tracing::warn!(
+                        "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    if attempt + 1 < max_retries {
+                        let delay = Self::retry_delay(attempt);
+                        tracing::info!("等待 {:.1}s 后重试", delay.as_secs_f32());
+                        sleep(delay).await;
+                    }
                 }
                 continue;
             }
@@ -335,6 +372,13 @@ impl KiroProvider {
                     continue;
                 }
             };
+
+            tracing::info!(
+                credential_id = ctx.id,
+                kiro_model = %model.as_deref().unwrap_or("unknown"),
+                "凭据 #{} 开始请求",
+                ctx.id
+            );
 
             // "全员 cooldown"兜底:若 select 返回的凭据自身仍在 cooldown,对剩余时长 sleep
             if let Some(remaining) = self.token_manager.cooldown_remaining_for(ctx.id) {
@@ -503,13 +547,6 @@ impl KiroProvider {
             // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
             // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
-                tracing::warn!(
-                    "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
@@ -517,14 +554,49 @@ impl KiroProvider {
                     body
                 ));
                 if status.as_u16() == 429 {
-                    // 标记 cooldown,下次 select 自动跳过当前凭据;不 sleep
-                    let cooldown_secs = retry_after_secs.unwrap_or(30).min(120);
-                    self.token_manager
-                        .mark_cooldown(ctx.id, Duration::from_secs(cooldown_secs));
-                } else if attempt + 1 < max_retries {
-                    let delay = Self::retry_delay(attempt);
-                    tracing::info!("等待 {:.1}s 后重试", delay.as_secs_f32());
-                    sleep(delay).await;
+                    if Self::is_suspicious_activity_429(&body) {
+                        let cooldown_secs = retry_after_secs.unwrap_or(600).min(600);
+                        tracing::warn!(
+                            credential_id = ctx.id,
+                            kiro_model = %model.as_deref().unwrap_or("unknown"),
+                            "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
+                            attempt + 1,
+                            max_retries,
+                            status,
+                            body
+                        );
+                        self.token_manager
+                            .mark_cooldown(ctx.id, Duration::from_secs(cooldown_secs));
+                        tracing::info!("凭据 #{} 标记 cooldown {} 秒(可疑活动限流)", ctx.id, cooldown_secs);
+                        self.token_manager.report_failure(ctx.id);
+                    } else {
+                        let cooldown_secs = retry_after_secs.unwrap_or(30).min(120);
+                        tracing::warn!(
+                            credential_id = ctx.id,
+                            kiro_model = %model.as_deref().unwrap_or("unknown"),
+                            "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
+                            attempt + 1,
+                            max_retries,
+                            status,
+                            body
+                        );
+                        self.token_manager
+                            .mark_cooldown(ctx.id, Duration::from_secs(cooldown_secs));
+                        tracing::info!("凭据 #{} 标记 cooldown {} 秒(容量不足限流)", ctx.id, cooldown_secs);
+                    }
+                } else {
+                    tracing::warn!(
+                        "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    if attempt + 1 < max_retries {
+                        let delay = Self::retry_delay(attempt);
+                        tracing::info!("等待 {:.1}s 后重试", delay.as_secs_f32());
+                        sleep(delay).await;
+                    }
                 }
                 continue;
             }
