@@ -8,8 +8,6 @@
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
@@ -178,7 +176,6 @@ impl KiroProvider {
                     last_error = Some(e.into());
                     if attempt < max_retries {
                         self.token_manager.rotate_credential();
-                        sleep(Self::retry_delay(attempt)).await;
                     }
                     continue;
                 }
@@ -243,7 +240,6 @@ impl KiroProvider {
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if attempt < max_retries {
                     self.token_manager.rotate_credential();
-                    sleep(Self::retry_delay(attempt)).await;
                 }
                 continue;
             }
@@ -257,7 +253,6 @@ impl KiroProvider {
             last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
             if attempt < max_retries {
                 self.token_manager.rotate_credential();
-                sleep(Self::retry_delay(attempt)).await;
             }
         }
 
@@ -335,7 +330,6 @@ impl KiroProvider {
                     last_error = Some(e.into());
                     if attempt < max_retries {
                         self.token_manager.rotate_credential();
-                        sleep(Self::retry_delay(attempt)).await;
                     }
                     continue;
                 }
@@ -443,7 +437,6 @@ impl KiroProvider {
                 ));
                 if attempt < max_retries {
                     self.token_manager.rotate_credential();
-                    sleep(Self::retry_delay(attempt)).await;
                 }
                 continue;
             }
@@ -469,7 +462,6 @@ impl KiroProvider {
             ));
             if attempt < max_retries {
                 self.token_manager.rotate_credential();
-                sleep(Self::retry_delay(attempt)).await;
             }
         }
 
@@ -497,16 +489,5 @@ impl KiroProvider {
             .get("modelId")?
             .as_str()
             .map(|s| s.to_string())
-    }
-
-    fn retry_delay(attempt: usize) -> Duration {
-        // 指数退避 + 少量抖动，避免上游抖动时放大故障
-        const BASE_MS: u64 = 200;
-        const MAX_MS: u64 = 2_000;
-        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
-        let backoff = exp.min(MAX_MS);
-        let jitter_max = (backoff / 4).max(1);
-        let jitter = fastrand::u64(0..=jitter_max);
-        Duration::from_millis(backoff.saturating_add(jitter))
     }
 }
