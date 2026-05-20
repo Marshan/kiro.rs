@@ -125,7 +125,7 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
-        for attempt in 0..max_retries {
+        for attempt in 0..=max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
             let ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
@@ -176,7 +176,8 @@ impl KiroProvider {
                         e
                     );
                     last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
+                    if attempt < max_retries {
+                        self.token_manager.rotate_credential();
                         sleep(Self::retry_delay(attempt)).await;
                     }
                     continue;
@@ -240,7 +241,8 @@ impl KiroProvider {
                     body
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-                if attempt + 1 < max_retries {
+                if attempt < max_retries {
+                    self.token_manager.rotate_credential();
                     sleep(Self::retry_delay(attempt)).await;
                 }
                 continue;
@@ -253,7 +255,8 @@ impl KiroProvider {
 
             // 兜底
             last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-            if attempt + 1 < max_retries {
+            if attempt < max_retries {
+                self.token_manager.rotate_credential();
                 sleep(Self::retry_delay(attempt)).await;
             }
         }
@@ -279,7 +282,7 @@ impl KiroProvider {
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 
-        for attempt in 0..max_retries {
+        for attempt in 0..=max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
@@ -328,10 +331,10 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
+                    // 网络错误通常是上游/链路瞬态问题，不应计入失败次数
                     last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
+                    if attempt < max_retries {
+                        self.token_manager.rotate_credential();
                         sleep(Self::retry_delay(attempt)).await;
                     }
                     continue;
@@ -423,8 +426,7 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
+            // 429/408/5xx - 瞬态上游错误：重试但不禁用凭据，换一张凭据重试
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
@@ -439,7 +441,8 @@ impl KiroProvider {
                     status,
                     body
                 ));
-                if attempt + 1 < max_retries {
+                if attempt < max_retries {
+                    self.token_manager.rotate_credential();
                     sleep(Self::retry_delay(attempt)).await;
                 }
                 continue;
@@ -450,7 +453,7 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
-            // 兜底：当作可重试的瞬态错误处理（不切换凭据）
+            // 兜底：当作可重试的瞬态错误处理
             tracing::warn!(
                 "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
                 attempt + 1,
@@ -464,7 +467,8 @@ impl KiroProvider {
                 status,
                 body
             ));
-            if attempt + 1 < max_retries {
+            if attempt < max_retries {
+                self.token_manager.rotate_credential();
                 sleep(Self::retry_delay(attempt)).await;
             }
         }
