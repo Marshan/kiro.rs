@@ -102,6 +102,10 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// 请求失败时的最大重试次数（默认 3，设为 0 表示不重试）
+    #[serde(default = "default_max_retries")]
+    pub max_retries: usize,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -159,6 +163,10 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+fn default_max_retries() -> usize {
+    3
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -183,6 +191,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
+            max_retries: default_max_retries(),
             endpoints: HashMap::new(),
             config_path: None,
         }
