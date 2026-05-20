@@ -19,6 +19,12 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
+/// 每个凭据的最大重试次数
+const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
+
+/// 总重试次数硬上限（避免无限重试）
+const MAX_TOTAL_RETRIES: usize = 9;
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -121,7 +127,8 @@ impl KiroProvider {
 
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        let max_retries = self.token_manager.config().max_retries;
+        let total_credentials = self.token_manager.total_count();
+        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
@@ -265,13 +272,17 @@ impl KiroProvider {
 
     /// 内部方法：带重试逻辑的 API 调用
     ///
-    /// 重试次数由配置项 `maxRetries` 控制（默认 3，设为 0 不重试）
+    /// 重试策略：
+    /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
+    /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
+    /// - 硬上限 9 次，避免无限重试
     async fn call_api_with_retry(
         &self,
         request_body: &str,
         is_stream: bool,
     ) -> anyhow::Result<reqwest::Response> {
-        let max_retries = self.token_manager.config().max_retries;
+        let total_credentials = self.token_manager.total_count();
+        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };

@@ -6,6 +6,5 @@
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
   "loadBalancingMode": "round_robin",
-  "defaultEndpoint": "ide",
-  "maxRetries": 0
+  "defaultEndpoint": "ide"
 }
