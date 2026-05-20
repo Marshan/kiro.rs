@@ -1267,37 +1267,6 @@ impl MultiTokenManager {
         result
     }
 
-    /// 轮换到下一个可用凭据（不计入失败次数）
-    ///
-    /// 用于 429 等瞬态限流场景：不惩罚当前凭据，只是换一张重试。
-    /// 返回 false 表示没有其他可用凭据可切换。
-    pub fn rotate_credential(&self) -> bool {
-        let entries = self.entries.lock();
-        let current_id = *self.current_id.lock();
-
-        let start = entries
-            .iter()
-            .position(|e| e.id == current_id)
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-
-        for offset in 0..entries.len() {
-            let idx = (start + offset) % entries.len();
-            if !entries[idx].disabled && entries[idx].id != current_id {
-                let mut cur = self.current_id.lock();
-                *cur = entries[idx].id;
-                tracing::info!(
-                    "429 限流：轮换凭据 #{} → #{}",
-                    current_id,
-                    entries[idx].id
-                );
-                return true;
-            }
-        }
-
-        false
-    }
-
     /// 报告指定凭据额度已用尽
     ///
     /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
