@@ -95,6 +95,8 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-opus-4.6".to_string())
         } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
             Some("claude-opus-4.7".to_string())
+        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
+            Some("claude-opus-4.8".to_string())
         } else {
             None
         }
@@ -112,7 +114,8 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 4.7 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
-        Some(mapped) if mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" => 1_000_000,
+        Some(mapped) if mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6"
+            || mapped == "claude-opus-4.7"  || mapped == "claude-opus-4.8" => 1_000_000,
         _ => 200_000,
     }
 }
