@@ -26,6 +26,7 @@
 
 基于原作者 2026.5.10 master 分支，新增以下功能：
 
+- **Claude Opus 4.8 模型支持**：客户端请求中模型名包含 `4.8` 或 `4-8` 时自动映射到 `claude-opus-4.8`
 - **Claude Opus 4.7 模型支持**：客户端请求中模型名包含 `4.7` 或 `4-7` 时自动映射到 `claude-opus-4.7`
 - **API 调用明细日志**：可选开启，将每次 LLM 请求/响应明文记录到文件，便于调试和审计（配置项 `apiLogEnabled` / `apiLogPath`）
 
@@ -449,6 +450,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
 | `*sonnet*` | `claude-sonnet-4.5` |
+| `*opus*`（含 4.8/4-8） | `claude-opus-4.8` |
 | `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
 | `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
 | `*opus*`（其他） | `claude-opus-4.6` |

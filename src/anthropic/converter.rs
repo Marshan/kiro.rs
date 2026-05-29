@@ -80,6 +80,7 @@ Complete all chunked operations without commentary.";
 /// 按照用户要求：
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
+/// - opus 4.8/4-8 → claude-opus-4.8
 /// - opus 4.7/4-7 → claude-opus-4.7
 /// - opus 4.5/4-5 → claude-opus-4.5
 /// - 其他 opus → claude-opus-4.6
@@ -94,7 +95,9 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.5".to_string())
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-7") || model_lower.contains("4.7") {
+        if model_lower.contains("4-8") || model_lower.contains("4.8") {
+            Some("claude-opus-4.8".to_string())
+        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
             Some("claude-opus-4.7".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
@@ -114,7 +117,14 @@ pub fn map_model(model: &str) -> Option<String> {
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
-        Some(mapped) if mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" => 1_000_000,
+        Some(mapped)
+            if mapped == "claude-sonnet-4.6"
+                || mapped == "claude-opus-4.6"
+                || mapped == "claude-opus-4.7"
+                || mapped == "claude-opus-4.8" =>
+        {
+            1_000_000
+        }
         _ => 200_000,
     }
 }
@@ -972,6 +982,30 @@ mod tests {
     fn test_map_model_opus_4_7_thinking() {
         let result = map_model("claude-opus-4-7-thinking");
         assert_eq!(result, Some("claude-opus-4.7".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_opus_4_8_versioned() {
+        let result = map_model("claude-opus-4-8-20260529");
+        assert_eq!(result, Some("claude-opus-4.8".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_opus_4_8_dot_notation() {
+        let result = map_model("claude-opus-4.8");
+        assert_eq!(result, Some("claude-opus-4.8".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_opus_4_8_thinking() {
+        let result = map_model("claude-opus-4-8-thinking");
+        assert_eq!(result, Some("claude-opus-4.8".to_string()));
+    }
+
+    #[test]
+    fn test_get_context_window_size_opus_4_8() {
+        assert_eq!(get_context_window_size("claude-opus-4-8-20260529"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-4.8"), 1_000_000);
     }
 
     #[test]
