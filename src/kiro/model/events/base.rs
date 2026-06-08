@@ -10,6 +10,8 @@ use crate::kiro::parser::frame::Frame;
 pub enum EventType {
     /// 助手响应事件
     AssistantResponse,
+    /// 推理内容事件
+    ReasoningContent,
     /// 工具使用事件
     ToolUse,
     /// 计费事件
@@ -25,6 +27,7 @@ impl EventType {
     pub fn from_str(s: &str) -> Self {
         match s {
             "assistantResponseEvent" => Self::AssistantResponse,
+            "reasoningContentEvent" => Self::ReasoningContent,
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
@@ -36,6 +39,7 @@ impl EventType {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AssistantResponse => "assistantResponseEvent",
+            Self::ReasoningContent => "reasoningContentEvent",
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
@@ -65,6 +69,8 @@ pub trait EventPayload: Sized {
 pub enum Event {
     /// 助手响应
     AssistantResponse(super::AssistantResponseEvent),
+    /// 推理内容
+    ReasoningContent(super::ReasoningContentEvent),
     /// 工具使用
     ToolUse(super::ToolUseEvent),
     /// 计费
@@ -111,6 +117,10 @@ impl Event {
             EventType::AssistantResponse => {
                 let payload = super::AssistantResponseEvent::from_frame(&frame)?;
                 Ok(Self::AssistantResponse(payload))
+            }
+            EventType::ReasoningContent => {
+                let payload = super::ReasoningContentEvent::from_frame(&frame)?;
+                Ok(Self::ReasoningContent(payload))
             }
             EventType::ToolUse => {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;

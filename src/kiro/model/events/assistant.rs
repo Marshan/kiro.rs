@@ -56,6 +56,17 @@ impl Default for AssistantResponseEvent {
     }
 }
 
+impl AssistantResponseEvent {
+    /// 创建助手响应事件
+    pub fn new(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            extra: serde_json::Value::Null,
+        }
+    }
+}
+
+
 impl std::fmt::Display for AssistantResponseEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.content)

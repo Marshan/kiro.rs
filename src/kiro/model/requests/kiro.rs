@@ -13,9 +13,8 @@ use super::conversation::ConversationState;
 /// # 示例
 ///
 /// ```rust
-/// use kiro_rs::kiro::model::requests::{
-///     KiroRequest, ConversationState, CurrentMessage, UserInputMessage, Tool
-/// };
+/// use kiro_rs::kiro::model::requests::kiro::KiroRequest;
+/// use kiro_rs::kiro::model::requests::conversation::{ConversationState, CurrentMessage, UserInputMessage};
 ///
 /// // 创建简单请求
 /// let state = ConversationState::new("conv-123")
@@ -24,8 +23,13 @@ use super::conversation::ConversationState;
 ///         UserInputMessage::new("Hello", "claude-3-5-sonnet")
 ///     ));
 ///
-/// let request = KiroRequest::new(state);
-/// let json = request.to_json().unwrap();
+/// let request = KiroRequest {
+///     conversation_state: state,
+///     profile_arn: None,
+///     additional_model_request_fields: None,
+/// };
+///
+/// let json = serde_json::to_string(&request).unwrap();
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +39,9 @@ pub struct KiroRequest {
     /// Profile ARN（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
+    /// 额外模型请求字段（如 effort 等，可选）
+    #[serde(rename = "additionalModelRequestFields", skip_serializing_if = "Option::is_none")]
+    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 #[cfg(test)]
 mod tests {

@@ -259,10 +259,13 @@ pub async fn post_messages(
         }
     };
 
+    let additional_model_fields = get_additional_model_request_fields(&payload);
+
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: additional_model_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -311,9 +314,8 @@ pub async fn post_messages(
         )
         .await
     } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        // 非流式响应
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, thinking_enabled, tool_name_map).await
     }
 }
 
@@ -490,6 +492,7 @@ async fn handle_non_stream_request(
         tracing::warn!("缓冲区溢出: {}", e);
     }
 
+    let mut thinking_content = String::new();
     let mut text_content = String::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
@@ -506,6 +509,9 @@ async fn handle_non_stream_request(
             Ok(frame) => {
                 if let Ok(event) = Event::from_frame(frame) {
                     match event {
+                        Event::ReasoningContent(resp) => {
+                            thinking_content.push_str(&resp.text);
+                        }
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
                         }
@@ -588,21 +594,16 @@ async fn handle_non_stream_request(
     let mut content: Vec<serde_json::Value> = Vec::new();
 
     if thinking_enabled {
-        // 从完整文本中提取 thinking 块
-        let (thinking, remaining_text) =
-            super::stream::extract_thinking_from_complete_text(&text_content);
-
-        if let Some(thinking_text) = thinking {
+        if !thinking_content.is_empty() {
             content.push(json!({
                 "type": "thinking",
-                "thinking": thinking_text
+                "thinking": thinking_content
             }));
         }
-
-        if !remaining_text.is_empty() {
+        if !text_content.is_empty() {
             content.push(json!({
                 "type": "text",
-                "text": remaining_text
+                "text": text_content
             }));
         }
     } else if !text_content.is_empty() {
@@ -674,6 +675,32 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
             effort: "high".to_string(),
         });
     }
+}
+
+fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<serde_json::Value> {
+    if let Some(ref t) = payload.thinking {
+        if t.is_enabled() {
+            let effort = if t.thinking_type == "adaptive" {
+                payload
+                    .output_config
+                    .as_ref()
+                    .map(|c| c.effort.clone())
+                    .unwrap_or_else(|| "high".to_string())
+            } else {
+                if t.budget_tokens >= 4000 {
+                    "max".to_string()
+                } else {
+                    "high".to_string()
+                }
+            };
+            return Some(serde_json::json!({
+                "output_config": {
+                    "effort": effort
+                }
+            }));
+        }
+    }
+    None
 }
 
 /// POST /v1/messages/count_tokens
@@ -772,10 +799,13 @@ pub async fn post_messages_cc(
         }
     };
 
+    let additional_model_fields = get_additional_model_request_fields(&payload);
+
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: additional_model_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -824,9 +854,8 @@ pub async fn post_messages_cc(
         )
         .await
     } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        // 非流式响应
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, thinking_enabled, tool_name_map).await
     }
 }
 
