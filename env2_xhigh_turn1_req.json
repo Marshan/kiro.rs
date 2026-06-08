@@ -7,16 +7,10 @@
       "content": "Design a thread-safe concurrent map in Rust using Mutex or RwLock sharding. Provide a complete and clean implementation code."
     }
   ],
-  "stream": false,
-  "system": null,
-  "tools": null,
-  "tool_choice": null,
   "thinking": {
-    "type": "adaptive",
-    "budget_tokens": 20000
+    "type": "adaptive"
   },
   "output_config": {
-    "effort": "max"
-  },
-  "metadata": null
+    "effort": "xhigh"
+  }
 }

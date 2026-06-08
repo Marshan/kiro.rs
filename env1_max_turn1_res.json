@@ -18,5 +18,8 @@
   "usage": {
     "input_tokens": 20320,
     "output_tokens": 2195
+  },
+  "test_metadata": {
+    "elapsed_seconds": 140.02725911140442
   }
 }

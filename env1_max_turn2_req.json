@@ -24,16 +24,10 @@
       "content": "Now, explain how you would optimize read-safety and memory overhead of your implementation under high read contention, and show the code changes."
     }
   ],
-  "stream": false,
-  "system": null,
-  "tools": null,
-  "tool_choice": null,
   "thinking": {
-    "type": "adaptive",
-    "budget_tokens": 20000
+    "type": "adaptive"
   },
   "output_config": {
     "effort": "max"
-  },
-  "metadata": null
+  }
 }

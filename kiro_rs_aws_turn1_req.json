@@ -1,21 +1,21 @@
 {
   "conversationState": {
-    "agentContinuationId": "b7385a9b-7aa9-4388-bed0-a0d36ebfe9b8",
+    "agentContinuationId": "5935189d-88f4-4efe-a93c-a23d0a39f3be",
     "agentTaskType": "vibe",
     "chatTriggerType": "MANUAL",
     "currentMessage": {
       "userInputMessage": {
         "userInputMessageContext": {},
-        "content": "There are three people: Alice, Bob, and Charlie. One of them is a knight (always tells the truth), one is a knave (always lies), and one is a spy (can lie or tell the truth).\nAlice says: 'Charlie is a knave.'\nBob says: 'Alice is a knight.'\nCharlie says: 'I am the spy.'\nWho is who? Explain the step-by-step reasoning.",
+        "content": "Design a thread-safe concurrent map in Rust using Mutex or RwLock sharding. Provide a complete and clean implementation code.",
         "modelId": "claude-opus-4.7",
         "origin": "AI_EDITOR"
       }
     },
-    "conversationId": "f664c8ac-9b78-43ea-b604-031c73dee301"
+    "conversationId": "f17d87a3-2f52-4349-a224-412d12e08c03"
   },
   "additionalModelRequestFields": {
     "output_config": {
-      "effort": "xhigh"
+      "effort": "max"
     }
   }
 }

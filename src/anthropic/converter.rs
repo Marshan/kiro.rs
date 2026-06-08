@@ -821,8 +821,8 @@ fn convert_assistant_message(
         _ => {}
     }
 
-    // Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
-    let final_content = if text_content.is_empty() && !tool_uses.is_empty() {
+    // Kiro API 要求 content 字段不能为空
+    let final_content = if text_content.trim().is_empty() {
         " ".to_string()
     } else {
         text_content
