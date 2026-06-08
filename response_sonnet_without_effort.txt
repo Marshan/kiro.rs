@@ -1,0 +1,26 @@
+=== HTTP Status ===
+400
+
+=== Headers ===
+date: Sun, 07 Jun 2026 14:54:51 GMT
+content-type: application/json
+content-length: 104
+connection: close
+x-amzn-requestid: 1f113071-9557-4d01-b271-e8d4d6e53512
+x-xss-protection: 1; mode=block
+strict-transport-security: max-age=47304000; includeSubDomains
+x-frame-options: DENY
+x-amzn-errortype: ValidationException:http://internal.amazon.com/coral/com.amazon.kiro.runtimeservice/
+cache-control: no-cache
+x-content-type-options: nosniff
+
+
+=== Decoded Text ===
+
+
+=== Decoded Errors ===
+HTTP Error Body:
+{"message":"Invalid model ID. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}
+
+=== Raw Response Hex (first 500 bytes) ===
+7b226d657373616765223a22496e76616c6964206d6f64656c2049442e20506c656173652073656c656374206120646966666572656e74206d6f64656c20746f20636f6e74696e75652e222c22726561736f6e223a22494e56414c49445f4d4f44454c5f4944227d
