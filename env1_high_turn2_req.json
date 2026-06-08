@@ -24,16 +24,10 @@
       "content": "Now, add a detailed explanation and code implementation for a batching mechanism (push/pop in batches) to amortize the cost of atomic CAS operations under high thread contention, and show the exact modifications."
     }
   ],
-  "stream": false,
-  "system": null,
-  "tools": null,
-  "tool_choice": null,
   "thinking": {
-    "type": "adaptive",
-    "budget_tokens": 20000
+    "type": "adaptive"
   },
   "output_config": {
     "effort": "high"
-  },
-  "metadata": null
+  }
 }

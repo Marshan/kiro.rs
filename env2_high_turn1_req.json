@@ -7,16 +7,10 @@
       "content": "Design a lock-free concurrent MPMC (Multi-Producer Multi-Consumer) queue in Rust. Use atomic operations instead of locks, implement a basic epoch-based or hazard-pointer memory reclamation to prevent the ABA problem, and provide the complete code implementation."
     }
   ],
-  "stream": false,
-  "system": null,
-  "tools": null,
-  "tool_choice": null,
   "thinking": {
-    "type": "adaptive",
-    "budget_tokens": 20000
+    "type": "adaptive"
   },
   "output_config": {
     "effort": "high"
-  },
-  "metadata": null
+  }
 }
