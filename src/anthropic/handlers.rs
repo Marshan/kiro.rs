@@ -283,6 +283,14 @@ pub async fn post_messages(
         }
     };
 
+    let turn = (payload.messages.len() + 1) / 2;
+    if let Ok(cc_req_json) = serde_json::to_string_pretty(&payload) {
+        let _ = std::fs::write(format!("kiro_rs_cc_turn{}_req.json", turn), cc_req_json);
+    }
+    if let Ok(aws_req_json) = serde_json::to_string_pretty(&kiro_request) {
+        let _ = std::fs::write(format!("kiro_rs_aws_turn{}_req.json", turn), aws_req_json);
+    }
+
     tracing::debug!("Kiro request body: {}", request_body);
 
     // 估算输入 tokens
@@ -301,6 +309,7 @@ pub async fn post_messages(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let conversation_id = kiro_request.conversation_state.conversation_id.clone();
 
     if payload.stream {
         // 流式响应
@@ -311,6 +320,7 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            conversation_id,
         )
         .await
     } else {
@@ -327,6 +337,7 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    conversation_id: String,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -335,7 +346,7 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, conversation_id);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -464,6 +475,13 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
+    let conversation_id = serde_json::from_str::<serde_json::Value>(request_body)
+        .ok()
+        .and_then(|v| v.get("conversationState").cloned())
+        .and_then(|v| v.get("conversationId").cloned())
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
         Ok(resp) => resp,
@@ -486,6 +504,14 @@ async fn handle_non_stream_request(
         }
     };
 
+    let turn = serde_json::from_str::<serde_json::Value>(request_body)
+        .ok()
+        .and_then(|v| v.get("conversationState").and_then(|cs| cs.get("history")).and_then(|h| h.as_array().map(|arr| arr.len())))
+        .map(|len| (len + 2) / 2)
+        .unwrap_or(1);
+
+    let _ = std::fs::write(format!("kiro_rs_aws_turn{}_res.txt", turn), &body_bytes);
+
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
     if let Err(e) = decoder.feed(&body_bytes) {
@@ -493,6 +519,7 @@ async fn handle_non_stream_request(
     }
 
     let mut thinking_content = String::new();
+    let mut signature = None;
     let mut text_content = String::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
@@ -511,6 +538,9 @@ async fn handle_non_stream_request(
                     match event {
                         Event::ReasoningContent(resp) => {
                             thinking_content.push_str(&resp.text);
+                            if let Some(ref sig) = resp.signature {
+                                signature = Some(sig.clone());
+                            }
                         }
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
@@ -635,6 +665,16 @@ async fn handle_non_stream_request(
             "output_tokens": output_tokens
         }
     });
+
+    if let (Some(sig), false) = (signature, conversation_id.is_empty()) {
+        super::converter::get_signature_cache()
+            .write()
+            .insert((conversation_id, thinking_content), sig);
+    }
+
+    if let Ok(cc_res_json) = serde_json::to_string_pretty(&response_body) {
+        let _ = std::fs::write(format!("kiro_rs_cc_turn{}_res.json", turn), cc_res_json);
+    }
 
     (StatusCode::OK, Json(response_body)).into_response()
 }
@@ -841,6 +881,7 @@ pub async fn post_messages_cc(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let conversation_id = kiro_request.conversation_state.conversation_id.clone();
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -851,6 +892,7 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            conversation_id,
         )
         .await
     } else {
@@ -870,6 +912,7 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    conversation_id: String,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -878,7 +921,7 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map, conversation_id);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

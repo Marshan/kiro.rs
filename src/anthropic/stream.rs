@@ -322,6 +322,12 @@ pub struct StreamContext {
     pub thinking_block_index: Option<i32>,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
+    /// 会话 ID，用于签名缓存
+    pub conversation_id: String,
+    /// 累积的 thinking 内容
+    pub accumulated_thinking: String,
+    /// 捕获到的推理签名
+    pub signature: Option<String>,
 }
 
 impl StreamContext {
@@ -331,6 +337,7 @@ impl StreamContext {
         input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        conversation_id: String,
     ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
@@ -346,6 +353,9 @@ impl StreamContext {
             thinking_extracted: false,
             thinking_block_index: None,
             text_block_index: None,
+            conversation_id,
+            accumulated_thinking: String::new(),
+            signature: None,
         }
     }
 
@@ -411,7 +421,13 @@ impl StreamContext {
     /// Process Kiro events and convert to Anthropic SSE events
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
-            Event::ReasoningContent(resp) => self.process_reasoning_content(&resp.text),
+            Event::ReasoningContent(resp) => {
+                if let Some(ref sig) = resp.signature {
+                    self.signature = Some(sig.clone());
+                }
+                self.accumulated_thinking.push_str(&resp.text);
+                self.process_reasoning_content(&resp.text)
+            }
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
@@ -707,6 +723,15 @@ impl StreamContext {
             }
         }
 
+        // 保存签名到全局缓存
+        if let (Some(sig), false) = (&self.signature, self.conversation_id.is_empty()) {
+            if !self.accumulated_thinking.is_empty() {
+                super::converter::get_signature_cache()
+                    .write()
+                    .insert((self.conversation_id.clone(), self.accumulated_thinking.clone()), sig.clone());
+            }
+        }
+
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
         // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
@@ -758,9 +783,10 @@ impl BufferedStreamContext {
         estimated_input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        conversation_id: String,
     ) -> Self {
         let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map, conversation_id);
         Self {
             inner,
             event_buffer: Vec::new(),
@@ -900,7 +926,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("short_abc12345".to_string(), "mcp__very_long_original_tool_name".to_string());
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map, "test-session".to_string());
         let _ = ctx.generate_initial_events();
 
         // 模拟 Kiro 返回短名称的 tool_use
@@ -924,7 +950,7 @@ mod tests {
 
     #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), "test-session".to_string());
 
         let initial_events = ctx.generate_initial_events();
         assert!(
@@ -993,7 +1019,7 @@ mod tests {
         use crate::kiro::model::events::ReasoningContentEvent;
         use crate::kiro::model::events::AssistantResponseEvent;
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), "test-session".to_string());
         let initial_events = ctx.generate_initial_events();
         assert_eq!(initial_events.len(), 1);
         assert_eq!(initial_events[0].event, "message_start");
@@ -1043,7 +1069,7 @@ mod tests {
     fn test_thinking_only_sets_max_tokens_stop_reason() {
         use crate::kiro::model::events::ReasoningContentEvent;
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), "test-session".to_string());
         let _ = ctx.generate_initial_events();
 
         let event1 = Event::ReasoningContent(ReasoningContentEvent::new("Thinking process..."));
@@ -1084,7 +1110,7 @@ mod tests {
         use crate::kiro::model::events::ReasoningContentEvent;
         use crate::kiro::model::events::AssistantResponseEvent;
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), "test-session".to_string());
         let _ = ctx.generate_initial_events();
 
         let event1 = Event::ReasoningContent(ReasoningContentEvent::new("Thinking process..."));
@@ -1111,7 +1137,7 @@ mod tests {
         use crate::kiro::model::events::ReasoningContentEvent;
         use crate::kiro::model::events::ToolUseEvent;
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), "test-session".to_string());
         let _ = ctx.generate_initial_events();
 
         let event1 = Event::ReasoningContent(ReasoningContentEvent::new("Thinking process..."));

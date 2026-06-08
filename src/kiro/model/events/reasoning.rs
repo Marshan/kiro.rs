@@ -19,6 +19,10 @@ pub struct ReasoningContentEvent {
     #[serde(default)]
     pub text: String,
 
+    /// 推理签名（如果存在）
+    #[serde(default)]
+    pub signature: Option<String>,
+
     /// 捕获其他未使用的字段，确保反序列化兼容性
     #[serde(flatten)]
     #[serde(skip_serializing)]
@@ -36,6 +40,7 @@ impl Default for ReasoningContentEvent {
     fn default() -> Self {
         Self {
             text: String::new(),
+            signature: None,
             extra: serde_json::Value::Null,
         }
     }
@@ -46,6 +51,7 @@ impl ReasoningContentEvent {
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
+            signature: None,
             extra: serde_json::Value::Null,
         }
     }

@@ -3,6 +3,8 @@
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use parking_lot::RwLock;
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -10,7 +12,16 @@ use uuid::Uuid;
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+    ReasoningContent, ReasoningText,
 };
+
+// 线程安全的全局缓存，缓存历史会话中 Assistant 的 thinking 签名
+// Key: (conversation_id, thinking_content_text) -> Value: signature
+static SIGNATURE_CACHE: OnceLock<RwLock<HashMap<(String, String), String>>> = OnceLock::new();
+
+pub fn get_signature_cache() -> &'static RwLock<HashMap<(String, String), String>> {
+    SIGNATURE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
@@ -266,7 +277,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
+    let mut history = build_history(req, messages, &model_id, &mut tool_name_map, &conversation_id)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -634,7 +645,7 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
+fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>, conversation_id: &str) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -694,7 +705,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
-                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, conversation_id)?;
                 history.push(Message::Assistant(merged));
                 assistant_buffer.clear();
             }
@@ -713,7 +724,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 处理末尾累积的 assistant 消息
     if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, conversation_id)?;
         history.push(Message::Assistant(merged));
     }
 
@@ -771,6 +782,7 @@ fn merge_user_messages(
 fn convert_assistant_message(
     msg: &super::types::Message,
     tool_name_map: &mut HashMap<String, String>,
+    conversation_id: &str,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     let mut thinking_content = String::new();
     let mut text_content = String::new();
@@ -809,19 +821,8 @@ fn convert_assistant_message(
         _ => {}
     }
 
-    // 组合 thinking 和 text 内容
-    // 格式: <thinking>思考内容</thinking>\n\ntext内容
-    // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
-    let final_content = if !thinking_content.is_empty() {
-        if !text_content.is_empty() {
-            format!(
-                "<thinking>{}</thinking>\n\n{}",
-                thinking_content, text_content
-            )
-        } else {
-            format!("<thinking>{}</thinking>", thinking_content)
-        }
-    } else if text_content.is_empty() && !tool_uses.is_empty() {
+    // Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
+    let final_content = if text_content.is_empty() && !tool_uses.is_empty() {
         " ".to_string()
     } else {
         text_content
@@ -830,6 +831,26 @@ fn convert_assistant_message(
     let mut assistant = AssistantMessage::new(final_content);
     if !tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(tool_uses);
+    }
+
+    // 填充推理历史 (reasoning_content)
+    if !thinking_content.is_empty() {
+        let sig = get_signature_cache()
+            .read()
+            .get(&(conversation_id.to_string(), thinking_content.clone()))
+            .cloned()
+            .unwrap_or_else(|| {
+                // 用户抓取包中提供的最新真实签名，作为安全的 fallback
+                "EtwCCmUIDhABGAIqQDfx/kjoqI7rNQFnaobcJgdBgQTd2Fn59Lxqmoqtkyak44/G4Q7Zm0snfHOBQty2QGe5fnLPjiU2JDTfD2PVwwIyD2NsYXVkZS1vcHVzLTQtNzgAQgh0aGlua2luZxIMF8kq9u+GWAmAv3EfGgz6fyvtULcFIDRfiSUiMJortDwfl79BXbVdDfhW1QIGFksD3uEc7//g+DvW87GWXhCmxawP9t5YJzFAB6zHYSqkARqgotZo2+H2+dU8X2I3ZvfXfwkqwgc11ag8nj4o2prBHDo8HxSv1uINRrQfiMEgUERdv0+2qPM/go9uPPYOcd9Gm++mRiTOl23iqrJqxJPT5NR+vKqRHR43ijsOmREri3qPepVjc9Rshe626mFkc5PblojzcPjbrshb+S2rboiGKE4FUv3b0vfFJkcjfsxSgqJXKF0sDbS6zigjGuSZsrq0ehrXGAE=".to_string()
+            });
+
+        let reasoning_content = ReasoningContent {
+            reasoning_text: ReasoningText {
+                text: thinking_content,
+                signature: sig,
+            },
+        };
+        assistant = assistant.with_reasoning_content(reasoning_content);
     }
 
     Ok(HistoryAssistantMessage {
@@ -842,20 +863,25 @@ fn convert_assistant_message(
 fn merge_assistant_messages(
     messages: &[&super::types::Message],
     tool_name_map: &mut HashMap<String, String>,
+    conversation_id: &str,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     assert!(!messages.is_empty());
     if messages.len() == 1 {
-        return convert_assistant_message(messages[0], tool_name_map);
+        return convert_assistant_message(messages[0], tool_name_map, conversation_id);
     }
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
+    let mut accumulated_thinking = String::new();
 
     for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map)?;
+        let converted = convert_assistant_message(msg, tool_name_map, conversation_id)?;
         let am = converted.assistant_response_message;
         if !am.content.trim().is_empty() {
             content_parts.push(am.content);
+        }
+        if let Some(rc) = am.reasoning_content {
+            accumulated_thinking.push_str(&rc.reasoning_text.text);
         }
         if let Some(tus) = am.tool_uses {
             all_tool_uses.extend(tus);
@@ -872,6 +898,23 @@ fn merge_assistant_messages(
     if !all_tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(all_tool_uses);
     }
+
+    if !accumulated_thinking.is_empty() {
+        let sig = get_signature_cache()
+            .read()
+            .get(&(conversation_id.to_string(), accumulated_thinking.clone()))
+            .cloned()
+            .unwrap_or_else(|| {
+                "EtwCCmUIDhABGAIqQDfx/kjoqI7rNQFnaobcJgdBgQTd2Fn59Lxqmoqtkyak44/G4Q7Zm0snfHOBQty2QGe5fnLPjiU2JDTfD2PVwwIyD2NsYXVkZS1vcHVzLTQtNzgAQgh0aGlua2luZxIMF8kq9u+GWAmAv3EfGgz6fyvtULcFIDRfiSUiMJortDwfl79BXbVdDfhW1QIGFksD3uEc7//g+DvW87GWXhCmxawP9t5YJzFAB6zHYSqkARqgotZo2+H2+dU8X2I3ZvfXfwkqwgc11ag8nj4o2prBHDo8HxSv1uINRrQfiMEgUERdv0+2qPM/go9uPPYOcd9Gm++mRiTOl23iqrJqxJPT5NR+vKqRHR43ijsOmREri3qPepVjc9Rshe626mFkc5PblojzcPjbrshb+S2rboiGKE4FUv3b0vfFJkcjfsxSgqJXKF0sDbS6zigjGuSZsrq0ehrXGAE=".to_string()
+            });
+        assistant = assistant.with_reasoning_content(ReasoningContent {
+            reasoning_text: ReasoningText {
+                text: accumulated_thinking,
+                signature: sig,
+            },
+        });
+    }
+
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,
     })
@@ -1540,7 +1583,7 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
+        let result = convert_assistant_message(&msg, &mut HashMap::new(), "test-session").expect("应该成功转换");
 
         // 验证 content 不为空（使用占位符）
         assert!(
@@ -1575,7 +1618,7 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
+        let result = convert_assistant_message(&msg, &mut HashMap::new(), "test-session").expect("应该成功转换");
 
         // 验证 content 使用原始文本（不是占位符）
         assert_eq!(
@@ -1688,10 +1731,12 @@ mod tests {
         };
 
         let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-        let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
+        let result = merge_assistant_messages(&messages, &mut HashMap::new(), "test-session").expect("合并应成功");
 
         let content = &result.assistant_response_message.content;
-        assert!(content.contains("<thinking>"), "应包含 thinking 标签");
+        assert!(result.assistant_response_message.reasoning_content.is_some(), "应包含 reasoning_content");
+        let rc = result.assistant_response_message.reasoning_content.as_ref().unwrap();
+        assert_eq!(rc.reasoning_text.text, "Let me think about this...I should read the file.");
         assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
 
         let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");

@@ -294,6 +294,21 @@ impl HistoryAssistantMessage {
     }
 }
 
+/// 推理文本
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningText {
+    pub text: String,
+    pub signature: String,
+}
+
+/// 推理内容
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningContent {
+    pub reasoning_text: ReasoningText,
+}
+
 /// 助手消息（历史记录中使用）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -303,6 +318,9 @@ pub struct AssistantMessage {
     /// 工具使用列表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_uses: Option<Vec<ToolUseEntry>>,
+    /// 推理内容
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<ReasoningContent>,
 }
 
 impl AssistantMessage {
@@ -311,12 +329,19 @@ impl AssistantMessage {
         Self {
             content: content.into(),
             tool_uses: None,
+            reasoning_content: None,
         }
     }
 
     /// 设置工具使用
     pub fn with_tool_uses(mut self, tool_uses: Vec<ToolUseEntry>) -> Self {
         self.tool_uses = Some(tool_uses);
+        self
+    }
+
+    /// 设置推理内容
+    pub fn with_reasoning_content(mut self, reasoning_content: ReasoningContent) -> Self {
+        self.reasoning_content = Some(reasoning_content);
         self
     }
 }

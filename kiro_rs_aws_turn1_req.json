@@ -1,6 +1,6 @@
 {
   "conversationState": {
-    "agentContinuationId": "64307859-1cb7-4194-858d-07528abb4e18",
+    "agentContinuationId": "b7385a9b-7aa9-4388-bed0-a0d36ebfe9b8",
     "agentTaskType": "vibe",
     "chatTriggerType": "MANUAL",
     "currentMessage": {
@@ -11,7 +11,7 @@
         "origin": "AI_EDITOR"
       }
     },
-    "conversationId": "24396918-986e-41b0-a24c-12f21bd56792"
+    "conversationId": "f664c8ac-9b78-43ea-b604-031c73dee301"
   },
   "additionalModelRequestFields": {
     "output_config": {
