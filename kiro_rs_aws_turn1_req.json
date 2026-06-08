@@ -1,0 +1,21 @@
+{
+  "conversationState": {
+    "agentContinuationId": "64307859-1cb7-4194-858d-07528abb4e18",
+    "agentTaskType": "vibe",
+    "chatTriggerType": "MANUAL",
+    "currentMessage": {
+      "userInputMessage": {
+        "userInputMessageContext": {},
+        "content": "There are three people: Alice, Bob, and Charlie. One of them is a knight (always tells the truth), one is a knave (always lies), and one is a spy (can lie or tell the truth).\nAlice says: 'Charlie is a knave.'\nBob says: 'Alice is a knight.'\nCharlie says: 'I am the spy.'\nWho is who? Explain the step-by-step reasoning.",
+        "modelId": "claude-opus-4.7",
+        "origin": "AI_EDITOR"
+      }
+    },
+    "conversationId": "24396918-986e-41b0-a24c-12f21bd56792"
+  },
+  "additionalModelRequestFields": {
+    "output_config": {
+      "effort": "xhigh"
+    }
+  }
+}

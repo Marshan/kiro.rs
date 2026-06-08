@@ -1,0 +1,22 @@
+{
+  "model": "claude-opus-4.7",
+  "max_tokens": 4096,
+  "messages": [
+    {
+      "role": "user",
+      "content": "There are three people: Alice, Bob, and Charlie. One of them is a knight (always tells the truth), one is a knave (always lies), and one is a spy (can lie or tell the truth).\nAlice says: 'Charlie is a knave.'\nBob says: 'Alice is a knight.'\nCharlie says: 'I am the spy.'\nWho is who? Explain the step-by-step reasoning."
+    }
+  ],
+  "stream": false,
+  "system": null,
+  "tools": null,
+  "tool_choice": null,
+  "thinking": {
+    "type": "adaptive",
+    "budget_tokens": 20000
+  },
+  "output_config": {
+    "effort": "xhigh"
+  },
+  "metadata": null
+}
