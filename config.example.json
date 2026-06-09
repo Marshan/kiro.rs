@@ -6,5 +6,7 @@
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
   "loadBalancingMode": "round_robin",
-  "defaultEndpoint": "ide"
+  "defaultEndpoint": "ide",
+  "signatureCacheMaxEntries": 10000,
+  "signatureCacheTtlHours": 12
 }

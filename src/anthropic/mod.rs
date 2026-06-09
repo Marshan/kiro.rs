@@ -23,6 +23,7 @@
 //! ```
 
 mod converter;
+pub mod signature_cache;
 mod handlers;
 mod middleware;
 mod router;

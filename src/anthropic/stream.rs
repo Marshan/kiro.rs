@@ -726,9 +726,11 @@ impl StreamContext {
         // 保存签名到全局缓存
         if let (Some(sig), false) = (&self.signature, self.conversation_id.is_empty()) {
             if !self.accumulated_thinking.is_empty() {
-                super::converter::get_signature_cache()
-                    .write()
-                    .insert((self.conversation_id.clone(), self.accumulated_thinking.clone()), sig.clone());
+                super::signature_cache::SignatureCacheManager::insert(
+                    self.conversation_id.clone(),
+                    self.accumulated_thinking.clone(),
+                    sig.clone(),
+                );
             }
         }
 

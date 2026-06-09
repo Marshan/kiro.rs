@@ -311,6 +311,8 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
     let conversation_id = kiro_request.conversation_state.conversation_id.clone();
 
+    super::signature_cache::SignatureCacheManager::touch(conversation_id.clone());
+
     if payload.stream {
         // 流式响应
         handle_stream_request(
@@ -344,6 +346,8 @@ async fn handle_stream_request(
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+
+    super::signature_cache::SignatureCacheManager::touch(conversation_id.clone());
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, conversation_id);
@@ -487,6 +491,8 @@ async fn handle_non_stream_request(
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+
+    super::signature_cache::SignatureCacheManager::touch(conversation_id.clone());
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -667,9 +673,9 @@ async fn handle_non_stream_request(
     });
 
     if let (Some(sig), false) = (signature, conversation_id.is_empty()) {
-        super::converter::get_signature_cache()
-            .write()
-            .insert((conversation_id, thinking_content), sig);
+        super::signature_cache::SignatureCacheManager::insert(
+            conversation_id, thinking_content, sig,
+        );
     }
 
     if let Ok(cc_res_json) = serde_json::to_string_pretty(&response_body) {
@@ -883,6 +889,8 @@ pub async fn post_messages_cc(
     let tool_name_map = conversion_result.tool_name_map;
     let conversation_id = kiro_request.conversation_state.conversation_id.clone();
 
+    super::signature_cache::SignatureCacheManager::touch(conversation_id.clone());
+
     if payload.stream {
         // 流式响应（缓冲模式）
         handle_stream_request_buffered(
@@ -919,6 +927,8 @@ async fn handle_stream_request_buffered(
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+
+    super::signature_cache::SignatureCacheManager::touch(conversation_id.clone());
 
     // 创建缓冲流处理上下文
     let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map, conversation_id);

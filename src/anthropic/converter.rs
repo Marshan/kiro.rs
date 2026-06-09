@@ -3,8 +3,6 @@
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
-use parking_lot::RwLock;
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -15,13 +13,7 @@ use crate::kiro::model::requests::conversation::{
     ReasoningContent, ReasoningText,
 };
 
-// 线程安全的全局缓存，缓存历史会话中 Assistant 的 thinking 签名
-// Key: (conversation_id, thinking_content_text) -> Value: signature
-static SIGNATURE_CACHE: OnceLock<RwLock<HashMap<(String, String), String>>> = OnceLock::new();
-
-pub fn get_signature_cache() -> &'static RwLock<HashMap<(String, String), String>> {
-    SIGNATURE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
+use super::signature_cache::SignatureCacheManager;
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
@@ -835,10 +827,7 @@ fn convert_assistant_message(
 
     // 填充推理历史 (reasoning_content)
     if !thinking_content.is_empty() {
-        let sig = get_signature_cache()
-            .read()
-            .get(&(conversation_id.to_string(), thinking_content.clone()))
-            .cloned()
+        let sig = SignatureCacheManager::get(conversation_id, &thinking_content)
             .unwrap_or_else(|| {
                 // 用户抓取包中提供的最新真实签名，作为安全的 fallback
                 "EtwCCmUIDhABGAIqQDfx/kjoqI7rNQFnaobcJgdBgQTd2Fn59Lxqmoqtkyak44/G4Q7Zm0snfHOBQty2QGe5fnLPjiU2JDTfD2PVwwIyD2NsYXVkZS1vcHVzLTQtNzgAQgh0aGlua2luZxIMF8kq9u+GWAmAv3EfGgz6fyvtULcFIDRfiSUiMJortDwfl79BXbVdDfhW1QIGFksD3uEc7//g+DvW87GWXhCmxawP9t5YJzFAB6zHYSqkARqgotZo2+H2+dU8X2I3ZvfXfwkqwgc11ag8nj4o2prBHDo8HxSv1uINRrQfiMEgUERdv0+2qPM/go9uPPYOcd9Gm++mRiTOl23iqrJqxJPT5NR+vKqRHR43ijsOmREri3qPepVjc9Rshe626mFkc5PblojzcPjbrshb+S2rboiGKE4FUv3b0vfFJkcjfsxSgqJXKF0sDbS6zigjGuSZsrq0ehrXGAE=".to_string()
@@ -900,10 +889,7 @@ fn merge_assistant_messages(
     }
 
     if !accumulated_thinking.is_empty() {
-        let sig = get_signature_cache()
-            .read()
-            .get(&(conversation_id.to_string(), accumulated_thinking.clone()))
-            .cloned()
+        let sig = SignatureCacheManager::get(conversation_id, &accumulated_thinking)
             .unwrap_or_else(|| {
                 "EtwCCmUIDhABGAIqQDfx/kjoqI7rNQFnaobcJgdBgQTd2Fn59Lxqmoqtkyak44/G4Q7Zm0snfHOBQty2QGe5fnLPjiU2JDTfD2PVwwIyD2NsYXVkZS1vcHVzLTQtNzgAQgh0aGlua2luZxIMF8kq9u+GWAmAv3EfGgz6fyvtULcFIDRfiSUiMJortDwfl79BXbVdDfhW1QIGFksD3uEc7//g+DvW87GWXhCmxawP9t5YJzFAB6zHYSqkARqgotZo2+H2+dU8X2I3ZvfXfwkqwgc11ag8nj4o2prBHDo8HxSv1uINRrQfiMEgUERdv0+2qPM/go9uPPYOcd9Gm++mRiTOl23iqrJqxJPT5NR+vKqRHR43ijsOmREri3qPepVjc9Rshe626mFkc5PblojzcPjbrshb+S2rboiGKE4FUv3b0vfFJkcjfsxSgqJXKF0sDbS6zigjGuSZsrq0ehrXGAE=".to_string()
             });
